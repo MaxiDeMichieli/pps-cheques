@@ -36,10 +36,13 @@ def detectar_cheques(imagen: np.ndarray, min_area_ratio: float = 0.05) -> list[n
     # Encontrar contornos
     contornos, _ = cv2.findContours(dilatado, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    print(f"DEBUG: Found {len(contornos)} contours, min_area={min_area}")
+
     cheques = []
-    for contorno in contornos:
+    for i, contorno in enumerate(contornos):
         area = cv2.contourArea(contorno)
         if area < min_area:
+            print(f"DEBUG: Contour {i}: area {area} < {min_area}, skipped")
             continue
 
         # Obtener bounding box
@@ -47,8 +50,11 @@ def detectar_cheques(imagen: np.ndarray, min_area_ratio: float = 0.05) -> list[n
 
         # Filtrar por relacion de aspecto (cheques son mas anchos que altos)
         aspect_ratio = w / h if h > 0 else 0
-        if aspect_ratio < 1.3 or aspect_ratio > 5.0:
-            continue
+        print(f"DEBUG: Contour {i}: area={area}, aspect={aspect_ratio:.2f}, box=({x},{y},{w},{h})")
+        # TEMP: Remove aspect ratio filter to see if contour is valid
+        # if aspect_ratio < 1.3 or aspect_ratio > 5.0:
+        #     print(f"DEBUG: Contour {i}: aspect ratio {aspect_ratio:.2f} out of range, skipped")
+        #     continue
 
         # Filtrar por tamaño minimo
         if w < ancho * 0.4 or h < alto * 0.08:

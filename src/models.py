@@ -12,6 +12,11 @@ class DatosCheque:
     monto_raw: str = ""
     monto_score: float = 0.0
 
+    # Fecha
+    fecha: str | None = None  # ISO format date string
+    fecha_raw: str = ""
+    fecha_score: float = 0.0
+
     # Metadata
     imagen_path: str = ""
     pdf_origen: str = ""

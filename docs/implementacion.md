@@ -1,30 +1,69 @@
-# Documento de implementacion - Lector de cheques escaneados
+# Documento de implementación - Lector de cheques escaneados
 
 ## 1. Objetivo del proyecto
 
-Desarrollar un programa en Python que lea archivos PDF con cheques argentinos de pago diferido escaneados, detecte cada cheque individual dentro de la pagina, recorte su imagen, extraiga los datos relevantes mediante OCR local (sin enviar datos por internet), y los almacene en un archivo JSON junto con las imagenes individuales.
+Desarrollar un programa en Python que lea archivos PDF con cheques argentinos de pago diferido escaneados, detecte cada cheque individual dentro de la página, recorte su imagen, extraiga los datos relevantes mediante OCR local (sin enviar datos por internet), y los almacene en un archivo JSON junto con las imágenes individuales.
 
-## 2. Estructura del proyecto
+## 2. Nueva Arquitectura del Sistema
+
+### 2.1 Estructura del proyecto
 
 ```
-C:\Folders\UNGS\PPS\Proyecto\
+C:\Folders\UNGS\PPS\pps-cheques\
 ├── main.py                    # CLI - punto de entrada
 ├── requirements.txt           # Dependencias
 ├── src/
 │   ├── __init__.py
-│   ├── pdf_processor.py       # Conversion PDF -> imagenes
-│   ├── check_detector.py      # Deteccion y recorte de cheques
-│   ├── monto_extractor.py     # Extraccion del monto con docTR
-│   └── models.py              # Modelo de datos y persistencia JSON
+│   ├── config.py              # Configuración centralizada
+│   ├── models.py              # Modelos de datos y persistencia JSON
+│   ├── pdf_processor.py       # Conversión PDF -> imágenes
+│   ├── check_detector.py      # Detección y recorte de cheques
+│   ├── ocr/                   # Capa de abstracción OCR
+│   │   ├── __init__.py
+│   │   ├── interfaces.py      # Interfaces OCR (Strategy Pattern)
+│   │   └── doctr_reader.py    # Implementación docTR
+│   ├── extractors/            # Extractores de campos
+│   │   ├── __init__.py
+│   │   ├── base.py            # Clase base FieldExtractor (Template Method)
+│   │   ├── amount/            # Extracción de montos
+│   │   │   ├── __init__.py
+│   │   │   ├── extractor.py   # AmountExtractor
+│   │   │   ├── parser.py      # Lógica de parsing de montos
+│   │   │   └── validators.py  # Validación de montos
+│   │   └── date/              # Extracción de fechas
+│   │       ├── __init__.py
+│   │       ├── extractor.py   # DateExtractor
+│   │       ├── parser.py      # Lógica de parsing de fechas
+│   │       └── validators.py  # Validación de fechas
+│   └── pipeline/              # Pipeline de procesamiento
+│       ├── __init__.py
+│       └── pipeline.py        # CheckProcessingPipeline (Pipeline Pattern)
 ├── output/
-│   ├── cheques.json           # Datos extraidos
-│   └── images/                # Imagenes recortadas de cada cheque
+│   ├── cheques.json           # Datos extraídos
+│   └── images/                # Imágenes recortadas de cada cheque
 └── docs/
     ├── implementacion.md      # Este documento
     └── pruebas_modelos.md     # Pruebas de modelos OCR
 ```
 
-## 3. Pipeline de procesamiento
+### 2.2 Patrones de diseño implementados
+
+#### Strategy Pattern (OCR Readers)
+- **Propósito**: Permitir múltiples implementaciones de OCR
+- **Implementación**: `OCRReader` interface con `DocTRReader`, `TesseractReader`, etc.
+- **Beneficio**: Fácil cambio entre motores OCR sin modificar el código de extracción
+
+#### Template Method Pattern (Field Extractors)
+- **Propósito**: Estandarizar el proceso de extracción de campos
+- **Implementación**: `FieldExtractor` base con pipeline: `_extract_raw()` → `_parse()` → `_validate()` → `_normalize()`
+- **Beneficio**: Consistencia en todos los extractores de campos
+
+#### Pipeline Pattern (Processing Pipeline)
+- **Propósito**: Orquestar múltiples extractores de manera ordenada
+- **Implementación**: `CheckProcessingPipeline` coordina `AmountExtractor`, `DateExtractor`, etc.
+- **Beneficio**: Fácil agregar nuevos campos sin modificar el flujo principal
+
+## 3. Pipeline de procesamiento actualizado
 
 El procesamiento de un PDF sigue estos pasos secuenciales:
 
@@ -32,22 +71,231 @@ El procesamiento de un PDF sigue estos pasos secuenciales:
 PDF de entrada
       |
       v
-[1] Conversion a imagen (300 DPI)
+[1] Conversión a imagen (300 DPI)
       |
       v
-[2] Deteccion de cheques individuales (OpenCV)
+[2] Detección de cheques individuales (OpenCV)
       |
       v
 [3] Recorte y guardado de cada cheque como PNG
       |
       v
-[4] Extraccion del monto numerico (docTR)
+[4] Pipeline de extracción de campos
+      |  ┌─ AmountExtractor ──┐
+      |  │  - OCR del área    │
+      |  │  - Parsing de monto│
+      |  │  - Validación      │
+      |  │  - Normalización   │
+      └─ DateExtractor ───┘
+         - OCR de múltiples áreas
+         - Parsing de fecha
+         - Validación
+         - Normalización
       |
       v
-[5] Normalizacion y guardado en JSON
+[5] Normalización y guardado en JSON
 ```
 
-## 4. Detalle de cada modulo
+## 4. Detalle de cada módulo
+
+### 4.1 Capa OCR (`src/ocr/`)
+
+#### `interfaces.py`
+- Define `OCRReader` interface (Strategy Pattern)
+- Define `OCRResult` para estandarizar resultados OCR
+- Permite múltiples implementaciones (docTR, Tesseract, APIs externas)
+
+#### `doctr_reader.py`
+- Implementación concreta usando docTR
+- Convierte resultados docTR al formato estándar `OCRResult`
+
+### 4.2 Extractors (`src/extractors/`)
+
+#### `base.py`
+- `FieldExtractor` abstract base class (Template Method Pattern)
+- Define el pipeline estándar de extracción
+- Subclases implementan métodos específicos: `_extract_raw()`, `_parse()`, `_validate()`, `_normalize()`
+
+#### `amount/`
+- **extractor.py**: Localiza el área del monto, coordina parsing y validación
+- **parser.py**: Convierte texto OCR a candidatos de monto
+- **validators.py**: Valida rangos, formato y confianza del monto
+
+#### `date/`
+- **extractor.py**: Maneja múltiples regiones de fecha (Template Method + Strategy)
+- **parser.py**: Parsea formatos de fecha argentinos (DD/MM/YYYY, etc.)
+- **validators.py**: Valida rangos de fecha y reglas de negocio
+
+### 4.3 Pipeline (`src/pipeline/`)
+
+#### `pipeline.py`
+- `CheckProcessingPipeline`: Coordina múltiples extractores
+- `CheckProcessingResult`: Estandariza resultados de procesamiento
+- Manejo de errores por extractor individual
+
+### 4.4 Configuración (`src/config.py`)
+- Configuración centralizada para OCR, extractores y pipeline
+- Soporte para variables de entorno
+- Fácil modificación de parámetros sin cambiar código
+
+## 5. Agregar nuevos extractores de campos
+
+### 5.1 Pasos para agregar un nuevo campo (ej: SignatureExtractor)
+
+1. **Crear estructura de directorio**:
+   ```
+   src/extractors/signature/
+   ├── __init__.py
+   ├── extractor.py
+   ├── parser.py      # Si necesita parsing complejo
+   └── validators.py  # Si tiene reglas de validación
+   ```
+
+2. **Implementar extractor**:
+   ```python
+   from ..base import FieldExtractor
+
+   class SignatureExtractor(FieldExtractor):
+       @property
+       def field_name(self) -> str:
+           return "firma"
+
+       def _extract_raw(self, check_image):
+           # Lógica específica para localizar firma
+           signature_region = self._locate_signature_region(check_image)
+           return self.ocr_reader.read(signature_region)
+
+       def _parse(self, raw_data):
+           # Lógica de parsing específica
+           return self.parser.parse(raw_data)
+
+       def _validate(self, parsed):
+           return self.validator.is_valid(parsed)
+
+       def _normalize(self, validated):
+           return {
+               'firma_detectada': validated.get('detected'),
+               'firma_confianza': validated.get('confidence'),
+               'firma_raw': validated.get('raw_text')
+           }
+   ```
+
+3. **Actualizar modelos de datos** (`src/models.py`):
+   ```python
+   @dataclass
+   class DatosCheque:
+       # ... campos existentes ...
+       firma_detectada: bool = False
+       firma_confianza: float = 0.0
+       firma_raw: str = ""
+   ```
+
+4. **Agregar al pipeline** (`main.py`):
+   ```python
+   extractors = [
+       AmountExtractor(ocr_reader),
+       DateExtractor(ocr_reader),
+       SignatureExtractor(ocr_reader),  # Nuevo
+   ]
+   ```
+
+5. **Actualizar validadores y parsers** según reglas de negocio específicas.
+
+### 5.2 Agregar nueva implementación OCR
+
+1. **Crear nueva clase**:
+   ```python
+   from .interfaces import OCRReader
+
+   class TesseractReader(OCRReader):
+       def read(self, image):
+           # Implementación con Tesseract
+           pass
+
+       def get_name(self):
+           return "Tesseract"
+   ```
+
+2. **Configurar en pipeline**:
+   ```python
+   ocr_reader = TesseractReader()  # En lugar de DocTRReader
+   ```
+
+## 6. Formato de salida
+
+### 6.1 Estructura JSON
+
+```json
+{
+  "total_cheques": 5,
+  "cheques": [
+    {
+      "monto": 15450.67,
+      "monto_raw": "$ 15.450,67",
+      "monto_score": 8.5,
+      "fecha": "2024-03-15",
+      "fecha_raw": "15/03/2024",
+      "fecha_score": 9.2,
+      "imagen_path": "output/images/cheque001_p1_ch1.png",
+      "pdf_origen": "cheques_marzo.pdf",
+      "pagina": 1,
+      "indice_en_pagina": 1
+    }
+  ]
+}
+```
+
+### 6.2 Campos disponibles
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `monto` | float/null | Monto numérico extraído |
+| `monto_raw` | string | Texto original del OCR |
+| `monto_score` | float | Confianza de la extracción (0-10) |
+| `fecha` | string/null | Fecha en formato ISO (YYYY-MM-DD) |
+| `fecha_raw` | string | Texto original de la fecha |
+| `fecha_score` | float | Confianza de la extracción de fecha |
+| `imagen_path` | string | Ruta a la imagen recortada |
+| `pdf_origen` | string | Nombre del PDF fuente |
+| `pagina` | int | Número de página en el PDF |
+| `indice_en_pagina` | int | Posición del cheque en la página |
+
+## 7. Extensibilidad futura
+
+### 7.1 Campos adicionales planificados
+- **Firma (Signature)**: Detección de presencia de firma
+- **Beneficiario (Payee)**: Nombre del beneficiario
+- **Banco (Bank)**: Identificación del banco emisor
+- **Número de cheque (Check Number)**: Número secuencial
+
+### 7.2 Mejoras de OCR
+- Integración con Tesseract como alternativa
+- APIs externas (Google Vision, Azure OCR) con configuración
+- Modelos de ML personalizados para cheques argentinos
+
+### 7.3 Validaciones de negocio
+- Reglas específicas por banco
+- Validación de CUIT/CUIL
+- Detección de cheques duplicados
+- Integración con bases de datos de cheques rechazados
+
+## 8. Consideraciones técnicas
+
+### 8.1 Rendimiento
+- OCR se ejecuta localmente (no requiere internet)
+- Pipeline procesa campos en paralelo potencialmente
+- Memoria optimizada para imágenes grandes
+
+### 8.2 Robustez
+- Cada extractor maneja errores independientemente
+- Pipeline continúa procesando otros campos si uno falla
+- Logging detallado para debugging
+
+### 8.3 Mantenibilidad
+- Separación clara de responsabilidades
+- Código modular y extensible
+- Configuración centralizada
+- Tests unitarios por componente
 
 ### 4.1 Conversion PDF a imagenes (`pdf_processor.py`)
 

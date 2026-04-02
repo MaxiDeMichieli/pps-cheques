@@ -2,23 +2,27 @@
 
 import argparse
 import sys
+import shutil
 from pathlib import Path
 
 from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques
-from src.monto_extractor import MontoExtractor
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
+from src.ocr import DocTRReader
+from src.extractors import AmountExtractor, DateExtractor
+from src.pipeline import CheckProcessingPipeline
 
 
-def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "output") -> list[DatosCheque]:
-    """Procesa un PDF con cheques escaneados."""
+def procesar_pdf(pdf_path: str, pipeline: CheckProcessingPipeline, output_dir: str = "output") -> list[DatosCheque]:
+    """Procesa un PDF con cheques escaneados usando el nuevo pipeline."""
     pdf_path = Path(pdf_path)
     img_dir = Path(output_dir) / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Procesando: {pdf_path.name}")
 
-    paginas = pdf_a_imagenes(str(pdf_path), dpi=300)
+    paginas = pdf_a_imagenes(str(pdf_path), dpi=150)  # TEMP: Test with lower DPI
+    print(f"  Converted to {len(paginas)} page images")
     print(f"  Paginas: {len(paginas)}")
 
     cheques_datos = []
@@ -34,31 +38,59 @@ def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "ou
 
             print(f"    Cheque {idx}...", end=" ", flush=True)
 
-            monto, monto_raw, monto_score = monto_ext.extraer(cheque_img)
+            # Usar el nuevo pipeline
+            result = pipeline.process_check(cheque_img, ruta_img)
+
+            # Extraer datos del resultado del pipeline
+            monto_data = result.fields.get('monto', {})
+            fecha_data = result.fields.get('fecha', {})
 
             datos = DatosCheque(
-                monto=monto,
-                monto_raw=monto_raw,
-                monto_score=monto_score,
+                monto=monto_data.get('monto'),
+                monto_raw=monto_data.get('monto_raw', ''),
+                monto_score=monto_data.get('monto_score', 0.0),
+                fecha=fecha_data.get('fecha'),
+                fecha_raw=fecha_data.get('fecha_raw', ''),
+                fecha_score=fecha_data.get('fecha_score', 0.0),
                 imagen_path=ruta_img,
                 pdf_origen=pdf_path.name,
                 pagina=num_pag,
                 indice_en_pagina=idx,
             )
+
             cheques_datos.append(datos)
 
-            monto_str = f"${monto:,.2f}" if monto else "no detectado"
-            print(f"Monto: {monto_str} (score={monto_score:.1f})")
+            # Mostrar resultado
+            monto_str = f"${monto_data.get('monto'):,.2f}" if monto_data.get('monto') else "no detectado"
+            monto_score = monto_data.get('monto_score', 0.0)
+            fecha_str = fecha_data.get('fecha', 'no detectada')
+            print(f"Monto: {monto_str} (score={monto_score:.1f}) | Fecha: {fecha_str}")
 
     return cheques_datos
 
 
 def cmd_procesar(args):
     """Comando: procesar PDF(s)."""
-    print("Inicializando docTR...")
+    # Limpiar directorio de salida anterior
+    output_path = Path(args.output)
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    
+    print("Inicializando pipeline de procesamiento...")
     from doctr.models import ocr_predictor
     doctr_model = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
-    monto_ext = MontoExtractor(doctr_model)
+    
+    # Crear OCR reader
+    ocr_reader = DocTRReader(doctr_model)
+    
+    # Crear extractores
+    extractors = [
+        AmountExtractor(ocr_reader),
+        DateExtractor(ocr_reader),
+    ]
+    
+    # Crear pipeline
+    pipeline = CheckProcessingPipeline(extractors)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
@@ -77,7 +109,7 @@ def cmd_procesar(args):
 
     todos_cheques = []
     for pdf in pdfs:
-        cheques = procesar_pdf(str(pdf), monto_ext, args.output)
+        cheques = procesar_pdf(str(pdf), pipeline, args.output)
         todos_cheques.extend(cheques)
         print()
 
@@ -100,9 +132,14 @@ def cmd_listar(args):
     for i, ch in enumerate(cheques, 1):
         monto = ch.get('monto')
         monto_str = f"${monto:,.2f}" if monto else "no detectado"
-        score = ch.get('monto_score', 0)
+        monto_score = ch.get('monto_score', 0)
+        
+        fecha = ch.get('fecha')
+        fecha_str = fecha if fecha else "no detectada"
+        fecha_score = ch.get('fecha_score', 0)
+        
         pdf = ch.get('pdf_origen', '?')
-        print(f"  {i:3d}. {monto_str:>16s}  score={score:.1f}  ({pdf})")
+        print(f"  {i:3d}. {monto_str:>16s} (score={monto_score:.1f}) | {fecha_str} (score={fecha_score:.1f}) | ({pdf})")
 
 
 def cmd_buscar(args):
