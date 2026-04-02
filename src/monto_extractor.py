@@ -1,24 +1,28 @@
 """Extractor de monto de cheques escaneados.
 
-Usa docTR para leer el monto numerico de la esquina superior derecha.
+Usa un lector OCR abstracto para leer el monto numerico de la esquina superior derecha.
 Estrategia simple:
-1. Buscar el $ con docTR en la zona superior
-2. Recortar alrededor del $ y leer con docTR (crudo, otsu, x2)
+1. Buscar el $ con OCR en la zona superior
+2. Recortar alrededor del $ y leer con OCR (crudo, otsu, x2)
 3. Si no hay buen resultado, probar zonas fijas
 4. Elegir el candidato con mejor formato de monto argentino
 5. Normalizar a float
+
+El lector OCR se inyecta via OCRReader, permitiendo usar docTR, Tesseract, EasyOCR, etc.
 """
 
 import cv2
 import numpy as np
 import re
 
+from .ocr_readers import OCRReader
+
 
 class MontoExtractor:
     """Extrae el monto numerico de un cheque escaneado."""
 
-    def __init__(self, doctr_model):
-        self.doctr = doctr_model
+    def __init__(self, ocr_reader: OCRReader):
+        self._ocr = ocr_reader
 
     def extraer(self, cheque_img: np.ndarray) -> tuple[float | None, str, float]:
         """Extrae el monto de un cheque.
@@ -32,7 +36,7 @@ class MontoExtractor:
 
         # ---- Paso 1: Encontrar $ y recortar alrededor ----
         zona_sup = cheque_img[0:int(h * 0.40), int(w * 0.40):w]
-        textos_sup = self._doctr_read(zona_sup)
+        textos_sup = self._ocr_read(zona_sup)
         dolar_pos = self._encontrar_dolar(textos_sup)
 
         if dolar_pos:
@@ -51,7 +55,7 @@ class MontoExtractor:
             if crop.size > 0:
                 for prep_fn in [self._noop, self._otsu, self._x2_otsu]:
                     img = prep_fn(crop)
-                    for txt in self._extraer_montos(self._doctr_read(img), cerca_dolar=True):
+                    for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=True):
                         candidatos.append((txt, True))
 
         # ---- Paso 2: Zonas fijas (siempre, complementa el paso 1) ----
@@ -60,7 +64,7 @@ class MontoExtractor:
                 zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
                 for prep_fn in [self._noop, self._otsu]:
                     img = prep_fn(zona)
-                    for txt in self._extraer_montos(self._doctr_read(img), cerca_dolar=False):
+                    for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
                         candidatos.append((txt, False))
                 if any(self._score(t, d) >= 5.0 for t, d in candidatos):
                     break
@@ -77,18 +81,9 @@ class MontoExtractor:
 
     # ---- OCR ----
 
-    def _doctr_read(self, img):
-        result = self.doctr([img])
-        partes = []
-        for page in result.pages:
-            for block in page.blocks:
-                for line in block.lines:
-                    for word in line.words:
-                        geo = word.geometry
-                        cx = (geo[0][0] + geo[1][0]) / 2
-                        cy = (geo[0][1] + geo[1][1]) / 2
-                        partes.append((word.value, word.confidence, cx, cy))
-        return partes
+    def _ocr_read(self, img):
+        """Lee texto de imagen usando el reader inyectado."""
+        return [(r.text, r.confidence, r.cx, r.cy) for r in self._ocr.read(img)]
 
     @staticmethod
     def _encontrar_dolar(textos):

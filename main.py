@@ -7,6 +7,7 @@ from pathlib import Path
 from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques
 from src.monto_extractor import MontoExtractor
+from src.ocr_readers import DocTRReader
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
 
@@ -55,10 +56,9 @@ def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "ou
 
 def cmd_procesar(args):
     """Comando: procesar PDF(s)."""
-    print("Inicializando docTR...")
-    from doctr.models import ocr_predictor
-    doctr_model = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
-    monto_ext = MontoExtractor(doctr_model)
+    print("Inicializando OCR (docTR)...")
+    ocr_reader = DocTRReader()
+    monto_ext = MontoExtractor(ocr_reader)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
