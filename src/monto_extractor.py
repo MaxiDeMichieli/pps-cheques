@@ -14,8 +14,12 @@ El lector OCR se inyecta via OCRReader, permitiendo usar docTR, Tesseract, EasyO
 import cv2
 import numpy as np
 import re
+from typing import TYPE_CHECKING
 
-from .ocr_readers import OCRReader
+from .ocr_readers import OCRReader, OCRResult
+
+if TYPE_CHECKING:
+    from .llm_validator import LLMValidator
 
 
 class MontoExtractor:
@@ -24,14 +28,27 @@ class MontoExtractor:
     def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
 
-    def extraer(self, cheque_img: np.ndarray) -> tuple[float | None, str, float]:
-        """Extrae el monto de un cheque.
+    def extraer(
+        self,
+        cheque_img: np.ndarray,
+        llm_validator: "LLMValidator | None" = None,
+        batch_context: list[str] | None = None,
+    ):
+        """Extrae el monto (y fecha_emision si hay LLM) de un cheque.
+
+        Args:
+            cheque_img: Imagen RGB del cheque recortado.
+            llm_validator: Validador LLM opcional. Si se provee, se usa para
+                extraer/validar monto y fecha_emision con score de confianza.
+            batch_context: Montos raw de otros cheques del lote, para contexto LLM.
 
         Returns:
-            (monto_float, monto_raw, score)
+            dict con claves: monto, monto_raw, monto_score, monto_llm_confidence,
+            fecha_emision, fecha_emision_raw, fecha_emision_llm_confidence.
         """
+        from .models import DatosCheque
+
         h, w = cheque_img.shape[:2]
-        # candidatos: lista de (texto_monto, cerca_dolar_bool)
         candidatos = []
 
         # ---- Paso 1: Encontrar $ y recortar alrededor ----
@@ -59,25 +76,62 @@ class MontoExtractor:
                         candidatos.append((txt, True))
 
         # ---- Paso 2: Zonas fijas (siempre, complementa el paso 1) ----
-        if True:
-            for x_pct, y_fin in [(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)]:
-                zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
-                for prep_fn in [self._noop, self._otsu]:
-                    img = prep_fn(zona)
-                    for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
-                        candidatos.append((txt, False))
-                if any(self._score(t, d) >= 5.0 for t, d in candidatos):
-                    break
+        for x_pct, y_fin in [(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)]:
+            zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
+            for prep_fn in [self._noop, self._otsu]:
+                img = prep_fn(zona)
+                for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
+                    candidatos.append((txt, False))
+            if any(self._score(t, d) >= 5.0 for t, d in candidatos):
+                break
 
-        # ---- Elegir mejor ----
-        if not candidatos:
-            return None, "", -1
+        # ---- Elegir mejor candidato OCR ----
+        if candidatos:
+            candidatos.sort(key=lambda c: self._score(c[0], c[1]), reverse=True)
+            mejor_txt, mejor_dolar = candidatos[0]
+            ocr_score = self._score(mejor_txt, mejor_dolar)
+            ocr_valor = self._normalizar(mejor_txt)
+        else:
+            mejor_txt, ocr_score, ocr_valor = "", -1, None
 
-        candidatos.sort(key=lambda c: self._score(c[0], c[1]), reverse=True)
-        mejor_txt, mejor_dolar = candidatos[0]
-        score = self._score(mejor_txt, mejor_dolar)
-        valor = self._normalizar(mejor_txt)
-        return valor, mejor_txt, score
+        # ---- Paso 3: LLM (si disponible) ----
+        monto_llm_confidence = None
+        fecha_emision = None
+        fecha_emision_raw = None
+        fecha_emision_llm_confidence = None
+        monto_final = ocr_valor
+        monto_raw_final = mejor_txt
+
+        if llm_validator is not None:
+            # Leer tokens del cheque completo para el LLM
+            full_tokens = self._ocr.read(cheque_img)
+            llm_results = llm_validator.extract_fields(full_tokens, batch_context or [])
+
+            llm_monto = llm_results.get("monto")
+            llm_fecha = llm_results.get("fecha_emision")
+
+            if llm_monto is not None:
+                monto_llm_confidence = llm_monto.confidence
+                # Usar valor LLM si confianza es suficiente
+                if llm_monto.confidence >= 0.70 and llm_monto.normalized is not None:
+                    monto_final = llm_monto.normalized
+                    monto_raw_final = llm_monto.value or mejor_txt
+
+            if llm_fecha is not None:
+                fecha_emision_llm_confidence = llm_fecha.confidence
+                if llm_fecha.confidence >= 0.70:
+                    fecha_emision = llm_fecha.normalized
+                    fecha_emision_raw = llm_fecha.value
+
+        return DatosCheque(
+            monto=monto_final,
+            monto_raw=monto_raw_final,
+            monto_score=ocr_score,
+            monto_llm_confidence=monto_llm_confidence,
+            fecha_emision=fecha_emision,
+            fecha_emision_raw=fecha_emision_raw,
+            fecha_emision_llm_confidence=fecha_emision_llm_confidence,
+        )
 
     # ---- OCR ----
 

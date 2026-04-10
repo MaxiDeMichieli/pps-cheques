@@ -1,0 +1,247 @@
+"""Validacion y extraccion de campos de cheques usando LLM local via Ollama.
+
+El LLM recibe los tokens OCR del cheque (texto + posiciones normalizadas) y
+el contexto del lote (montos ya vistos) para extraer campos estructurados con
+un score de confianza calibrado (0.0-1.0).
+
+Campos soportados actualmente:
+- monto: importe numerico en formato argentino (ej. "4.000.000")
+- fecha_emision: fecha de emision (ej. "11 DE Febrero DE 2026" -> "2026-02-11")
+"""
+
+import json
+import re
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from .ocr_readers import OCRResult
+
+
+logger = logging.getLogger(__name__)
+
+
+SYSTEM_PROMPT = """\
+Sos un experto en lectura de cheques bancarios argentinos (Cheques de Pago Diferido - CPD).
+Tu tarea es extraer campos especificos a partir de los tokens detectados por OCR en la imagen del cheque.
+
+### Campos a extraer
+
+1. **monto**: El importe del cheque. Esta escrito a mano en el recuadro que esta a la derecha del signo "$".
+   - Formato argentino: punto = separador de miles, coma = decimales. Ej: "4.000.000", "802.470,20"
+   - Nunca contiene letras. Si el OCR confunde un digito con una letra (ej. "l" por "1"), corregilo.
+   - Ignorar el numero de cheque (tipicamente 8 digitos sin puntos, ej. "14193346").
+
+2. **fecha_emision**: La fecha de emision del cheque. Aparece en la linea que comienza con el nombre
+   de una ciudad (ej. "QUILMES") seguido de la fecha en formato "DD DE MES DE AAAA".
+   - Normalizar al formato ISO: "YYYY-MM-DD".
+   - Meses en espanol: Enero=01, Febrero=02, Marzo=03, Abril=04, Mayo=05, Junio=06,
+     Julio=07, Agosto=08, Septiembre=09, Octubre=10, Noviembre=11, Diciembre=12.
+
+### Calibracion de confianza
+- 0.95-1.00: valor inequivoco, formato estandar reconocible
+- 0.80-0.94: legible con algo de ruido OCR, reconstruccion segura
+- 0.60-0.79: parcialmente reconstruido con ayuda del contexto del lote
+- 0.00-0.59: el LLM esta adivinando, resultado no confiable
+
+### Formato de respuesta
+Responde UNICAMENTE con un objeto JSON valido, sin texto adicional, sin markdown:
+{
+  "monto": {
+    "value": "<string tal como aparece en el cheque, o null>",
+    "confidence": <float 0.0-1.0>,
+    "reasoning": "<explicacion breve en una oracion>"
+  },
+  "fecha_emision": {
+    "value": "<YYYY-MM-DD normalizado, o null>",
+    "confidence": <float 0.0-1.0>,
+    "reasoning": "<explicacion breve en una oracion>"
+  }
+}
+"""
+
+
+@dataclass
+class LLMExtractionResult:
+    """Resultado de extraccion de un campo por el LLM."""
+    value: str | None
+    normalized: Any | None
+    confidence: float
+    reasoning: str
+
+
+_FAILED_RESULT = LLMExtractionResult(
+    value=None, normalized=None, confidence=0.0, reasoning="llm_unavailable"
+)
+
+_MESES = {
+    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+    "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+}
+
+
+def _normalizar_monto(value: str | None) -> float | None:
+    """Convierte string de monto argentino a float."""
+    if not value:
+        return None
+    limpio = value.strip().rstrip('-').rstrip(',')
+    limpio = re.sub(r'^[\$Ss]\s*', '', limpio)
+    if not limpio:
+        return None
+    try:
+        if ',' in limpio:
+            partes = limpio.split(',')
+            entero = partes[0].replace('.', '')
+            decimal = partes[1] if len(partes) > 1 else '0'
+            return float(f"{entero}.{decimal}")
+        return float(limpio.replace('.', ''))
+    except ValueError:
+        return None
+
+
+def _normalizar_fecha(value: str | None) -> str | None:
+    """Intenta parsear la fecha ya normalizada o en formato legible."""
+    if not value:
+        return None
+    # Ya esta en ISO
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', value.strip()):
+        return value.strip()
+    # Formato "DD DE MES DE YYYY" o variantes
+    m = re.search(
+        r'(\d{1,2})\s+(?:DE\s+)?(\w+)\s+(?:DE\s+)?(\d{4})',
+        value, re.IGNORECASE
+    )
+    if m:
+        dia = m.group(1).zfill(2)
+        mes_str = m.group(2).lower()
+        anio = m.group(3)
+        mes = _MESES.get(mes_str)
+        if mes:
+            return f"{anio}-{mes}-{dia}"
+    return None
+
+
+def _tokens_a_texto(ocr_tokens: list[OCRResult]) -> str:
+    """Convierte lista de OCRResult a texto estructurado para el prompt."""
+    tokens_ordenados = sorted(ocr_tokens, key=lambda t: (round(t.cy, 1), t.cx))
+    lineas = []
+    for t in tokens_ordenados:
+        lineas.append(f'  text="{t.text}" cx={t.cx:.2f} cy={t.cy:.2f} conf={t.confidence:.2f}')
+    return "\n".join(lineas)
+
+
+class LLMValidator:
+    """Extrae y valida campos de cheques usando un LLM local via Ollama."""
+
+    def __init__(
+        self,
+        model: str = "llama3.2",
+        base_url: str = "http://localhost:11434",
+        timeout: int = 60,
+    ):
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+
+    def extract_fields(
+        self,
+        ocr_tokens: list[OCRResult],
+        batch_context: list[str] | None = None,
+    ) -> dict[str, LLMExtractionResult]:
+        """Extrae monto y fecha_emision de los tokens OCR del cheque.
+
+        Args:
+            ocr_tokens: Tokens OCR del cheque completo (texto + posiciones).
+            batch_context: Montos raw de otros cheques del mismo lote, para
+                           ayudar al LLM a desambiguar valores dudosos.
+
+        Returns:
+            Dict con claves "monto" y "fecha_emision", cada una con un
+            LLMExtractionResult.
+        """
+        user_message = self._build_user_message(ocr_tokens, batch_context or [])
+        raw_response = self._call_ollama(user_message)
+        if raw_response is None:
+            return {"monto": _FAILED_RESULT, "fecha_emision": _FAILED_RESULT}
+        return self._parse_response(raw_response)
+
+    def _build_user_message(
+        self, ocr_tokens: list[OCRResult], batch_context: list[str]
+    ) -> str:
+        tokens_txt = _tokens_a_texto(ocr_tokens)
+        partes = [
+            "### Tokens OCR del cheque (texto, posicion normalizada 0-1, confianza OCR)\n",
+            tokens_txt,
+        ]
+        if batch_context:
+            ctx = ", ".join(f'"{m}"' for m in batch_context if m)
+            partes.append(
+                f"\n### Contexto del lote\nOtros cheques en este lote tienen montos: [{ctx}]. "
+                "Usa esta informacion para detectar si un valor parece anomalo o si el OCR "
+                "confundio digitos."
+            )
+        partes.append(
+            "\nExtrae los campos solicitados y responde SOLO con el JSON indicado."
+        )
+        return "\n".join(partes)
+
+    def _call_ollama(self, user_message: str) -> str | None:
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.0},
+        }
+        try:
+            response = httpx.post(
+                f"{self._base_url}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except httpx.ConnectError:
+            logger.warning("Ollama no disponible en %s", self._base_url)
+            return None
+        except Exception as exc:
+            logger.warning("Error llamando a Ollama: %s", exc)
+            return None
+
+    def _parse_response(self, raw: str) -> dict[str, LLMExtractionResult]:
+        # Extraer JSON aunque el LLM agregue texto extra
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if not match:
+            logger.warning("LLM no devolvio JSON valido: %s", raw[:200])
+            return {"monto": _FAILED_RESULT, "fecha_emision": _FAILED_RESULT}
+
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError as exc:
+            logger.warning("JSON invalido del LLM: %s", exc)
+            return {"monto": _FAILED_RESULT, "fecha_emision": _FAILED_RESULT}
+
+        monto_data = data.get("monto", {})
+        monto_value = monto_data.get("value")
+        monto_result = LLMExtractionResult(
+            value=monto_value,
+            normalized=_normalizar_monto(monto_value),
+            confidence=float(monto_data.get("confidence", 0.0)),
+            reasoning=monto_data.get("reasoning", ""),
+        )
+
+        fecha_data = data.get("fecha_emision", {})
+        fecha_value = fecha_data.get("value")
+        fecha_result = LLMExtractionResult(
+            value=fecha_value,
+            normalized=_normalizar_fecha(fecha_value),
+            confidence=float(fecha_data.get("confidence", 0.0)),
+            reasoning=fecha_data.get("reasoning", ""),
+        )
+
+        return {"monto": monto_result, "fecha_emision": fecha_result}

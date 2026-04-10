@@ -8,10 +8,16 @@ from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques
 from src.monto_extractor import MontoExtractor
 from src.ocr_readers import DocTRReader
+from src.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
 
-def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "output") -> list[DatosCheque]:
+def procesar_pdf(
+    pdf_path: str,
+    monto_ext: MontoExtractor,
+    output_dir: str = "output",
+    llm: LLMValidator | None = None,
+) -> list[DatosCheque]:
     """Procesa un PDF con cheques escaneados."""
     pdf_path = Path(pdf_path)
     img_dir = Path(output_dir) / "images"
@@ -23,6 +29,7 @@ def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "ou
     print(f"  Paginas: {len(paginas)}")
 
     cheques_datos = []
+    batch_montos_raw: list[str] = []
 
     for num_pag, pagina in enumerate(paginas, 1):
         cheques_img = detectar_cheques(pagina)
@@ -35,21 +42,23 @@ def procesar_pdf(pdf_path: str, monto_ext: MontoExtractor, output_dir: str = "ou
 
             print(f"    Cheque {idx}...", end=" ", flush=True)
 
-            monto, monto_raw, monto_score = monto_ext.extraer(cheque_img)
-
-            datos = DatosCheque(
-                monto=monto,
-                monto_raw=monto_raw,
-                monto_score=monto_score,
-                imagen_path=ruta_img,
-                pdf_origen=pdf_path.name,
-                pagina=num_pag,
-                indice_en_pagina=idx,
+            datos = monto_ext.extraer(
+                cheque_img,
+                llm_validator=llm,
+                batch_context=batch_montos_raw,
             )
+            datos.imagen_path = ruta_img
+            datos.pdf_origen = pdf_path.name
+            datos.pagina = num_pag
+            datos.indice_en_pagina = idx
+
+            batch_montos_raw.append(datos.monto_raw)
             cheques_datos.append(datos)
 
-            monto_str = f"${monto:,.2f}" if monto else "no detectado"
-            print(f"Monto: {monto_str} (score={monto_score:.1f})")
+            monto_str = f"${datos.monto:,.2f}" if datos.monto else "no detectado"
+            conf_str = f" llm={datos.monto_llm_confidence:.2f}" if datos.monto_llm_confidence is not None else ""
+            fecha_str = f" fecha={datos.fecha_emision}" if datos.fecha_emision else ""
+            print(f"Monto: {monto_str} (score={datos.monto_score:.1f}{conf_str}{fecha_str})")
 
     return cheques_datos
 
@@ -59,6 +68,11 @@ def cmd_procesar(args):
     print("Inicializando OCR (docTR)...")
     ocr_reader = DocTRReader()
     monto_ext = MontoExtractor(ocr_reader)
+
+    llm = None
+    if not args.sin_llm:
+        print(f"Inicializando LLM ({args.llm_model} @ {args.llm_url})...")
+        llm = LLMValidator(model=args.llm_model, base_url=args.llm_url)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
@@ -77,7 +91,7 @@ def cmd_procesar(args):
 
     todos_cheques = []
     for pdf in pdfs:
-        cheques = procesar_pdf(str(pdf), monto_ext, args.output)
+        cheques = procesar_pdf(str(pdf), monto_ext, args.output, llm=llm)
         todos_cheques.extend(cheques)
         print()
 
@@ -140,6 +154,12 @@ def main():
 
     p_proc = subparsers.add_parser("procesar", help="Procesar PDF(s) con cheques")
     p_proc.add_argument("entrada", help="Archivo PDF o directorio con PDFs")
+    p_proc.add_argument("--sin-llm", action="store_true",
+                        help="Desactivar validacion LLM (solo OCR heuristico)")
+    p_proc.add_argument("--llm-model", default="llama3.2",
+                        help="Modelo Ollama a usar (default: llama3.2)")
+    p_proc.add_argument("--llm-url", default="http://localhost:11434",
+                        help="URL del servidor Ollama (default: http://localhost:11434)")
     p_proc.set_defaults(func=cmd_procesar)
 
     p_list = subparsers.add_parser("listar", help="Listar cheques procesados")

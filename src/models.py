@@ -7,10 +7,18 @@ import json
 @dataclass
 class DatosCheque:
     """Datos extraidos de un cheque."""
-    # Monto
+    # Monto (OCR heuristico)
     monto: float | None = None
     monto_raw: str = ""
     monto_score: float = 0.0
+
+    # Monto (LLM)
+    monto_llm_confidence: float | None = None
+
+    # Fecha de emision (LLM)
+    fecha_emision: str | None = None        # ISO: "YYYY-MM-DD"
+    fecha_emision_raw: str | None = None    # tal como lo leyo el LLM
+    fecha_emision_llm_confidence: float | None = None
 
     # Metadata
     imagen_path: str = ""
