@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 logging.basicConfig(
@@ -12,7 +11,7 @@ logging.basicConfig(
 
 from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques
-from src.monto_extractor import MontoExtractor
+from src.cheque_extractor import ChequeExtractor
 from src.ocr_readers import DocTRReader
 from src.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
@@ -20,9 +19,8 @@ from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
 def procesar_pdf(
     pdf_path: str,
-    monto_ext: MontoExtractor,
+    extractor: ChequeExtractor,
     output_dir: str = "output",
-    llm: LLMValidator | None = None,
 ) -> list[DatosCheque]:
     """Procesa un PDF con cheques escaneados."""
     pdf_path = Path(pdf_path)
@@ -48,11 +46,7 @@ def procesar_pdf(
 
             print(f"    Cheque {idx}...", end=" ", flush=True)
 
-            datos = monto_ext.extraer(
-                cheque_img,
-                llm_validator=llm,
-                batch_context=batch_montos_raw,
-            )
+            datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw)
             datos.imagen_path = ruta_img
             datos.pdf_origen = pdf_path.name
             datos.pagina = num_pag
@@ -73,12 +67,13 @@ def cmd_procesar(args):
     """Comando: procesar PDF(s)."""
     print("Inicializando OCR (docTR)...")
     ocr_reader = DocTRReader()
-    monto_ext = MontoExtractor(ocr_reader)
 
     llm = None
     if not args.sin_llm:
         print(f"Inicializando LLM ({args.llm_model} @ {args.llm_url})...")
         llm = LLMValidator(model=args.llm_model, base_url=args.llm_url)
+
+    extractor = ChequeExtractor(ocr_reader, llm_validator=llm)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
@@ -97,7 +92,7 @@ def cmd_procesar(args):
 
     todos_cheques = []
     for pdf in pdfs:
-        cheques = procesar_pdf(str(pdf), monto_ext, args.output, llm=llm)
+        cheques = procesar_pdf(str(pdf), extractor, args.output)
         todos_cheques.extend(cheques)
         print()
 
