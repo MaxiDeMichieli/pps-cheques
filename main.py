@@ -1,8 +1,14 @@
 """CLI para procesamiento de cheques escaneados."""
 
 import argparse
+import logging
 import sys
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(name)s: %(message)s",
+)
 
 from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques

@@ -12,6 +12,7 @@ Campos soportados actualmente:
 import json
 import re
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,12 +126,14 @@ def _normalizar_fecha(value: str | None) -> str | None:
 
 
 def _tokens_a_texto(ocr_tokens: list[OCRResult]) -> str:
-    """Convierte lista de OCRResult a texto estructurado para el prompt."""
+    """Convierte lista de OCRResult a texto plano ordenado por posicion.
+
+    Omite coordenadas y confianza para reducir el largo del prompt.
+    Los tokens se ordenan fila a fila (cy redondeado) para que el LLM
+    los lea en orden natural de lectura.
+    """
     tokens_ordenados = sorted(ocr_tokens, key=lambda t: (round(t.cy, 1), t.cx))
-    lineas = []
-    for t in tokens_ordenados:
-        lineas.append(f'  text="{t.text}" cx={t.cx:.2f} cy={t.cy:.2f} conf={t.confidence:.2f}')
-    return "\n".join(lineas)
+    return " ".join(t.text for t in tokens_ordenados)
 
 
 class LLMValidator:
@@ -140,7 +143,7 @@ class LLMValidator:
         self,
         model: str = "llama3.2",
         base_url: str = "http://localhost:11434",
-        timeout: int = 60,
+        timeout: int = 180,
     ):
         self._model = model
         self._base_url = base_url.rstrip("/")
@@ -173,7 +176,7 @@ class LLMValidator:
     ) -> str:
         tokens_txt = _tokens_a_texto(ocr_tokens)
         partes = [
-            "### Tokens OCR del cheque (texto, posicion normalizada 0-1, confianza OCR)\n",
+            "### Texto OCR del cheque (tokens en orden de lectura)\n",
             tokens_txt,
         ]
         if batch_context:
@@ -199,12 +202,15 @@ class LLMValidator:
             "options": {"temperature": 0.0},
         }
         try:
+            t0 = time.perf_counter()
             response = httpx.post(
                 f"{self._base_url}/api/chat",
                 json=payload,
                 timeout=self._timeout,
             )
+            elapsed = time.perf_counter() - t0
             response.raise_for_status()
+            logger.info("LLM respondio en %.1fs", elapsed)
             return response.json()["message"]["content"]
         except httpx.ConnectError:
             logger.warning("Ollama no disponible en %s", self._base_url)
@@ -226,7 +232,7 @@ class LLMValidator:
             logger.warning("JSON invalido del LLM: %s", exc)
             return {"monto": _FAILED_RESULT, "fecha_emision": _FAILED_RESULT}
 
-        monto_data = data.get("monto", {})
+        monto_data = data.get("monto") or {}
         monto_value = monto_data.get("value")
         monto_result = LLMExtractionResult(
             value=monto_value,
@@ -235,7 +241,7 @@ class LLMValidator:
             reasoning=monto_data.get("reasoning", ""),
         )
 
-        fecha_data = data.get("fecha_emision", {})
+        fecha_data = data.get("fecha_emision") or {}
         fecha_value = fecha_data.get("value")
         fecha_result = LLMExtractionResult(
             value=fecha_value,
