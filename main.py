@@ -13,6 +13,7 @@ from src.pdf_processor import pdf_a_imagenes, guardar_imagen
 from src.check_detector import detectar_cheques
 from src.cheque_extractor import ChequeExtractor
 from src.ocr_readers import DocTRReader
+from src.llm_backends import OllamaBackend
 from src.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
@@ -71,7 +72,8 @@ def cmd_procesar(args):
     llm = None
     if not args.sin_llm:
         print(f"Inicializando LLM ({args.llm_model} @ {args.llm_url})...")
-        llm = LLMValidator(model=args.llm_model, base_url=args.llm_url)
+        backend = OllamaBackend(model=args.llm_model, base_url=args.llm_url)
+        llm = LLMValidator(backend=backend)
 
     extractor = ChequeExtractor(ocr_reader, llm_validator=llm)
     print("Listo.\n")
