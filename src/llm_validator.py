@@ -1,4 +1,4 @@
-"""Validacion y extraccion de campos de cheques usando LLM local via Ollama.
+"""Validacion y extraccion de campos de cheques usando LLM via backend intercambiable.
 
 El LLM recibe los tokens OCR del cheque (texto + posiciones normalizadas) y
 el contexto del lote (montos ya vistos) para extraer campos estructurados con
@@ -12,12 +12,10 @@ Campos soportados actualmente:
 import json
 import re
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
+from .llm_backends import LLMBackend
 from .ocr_readers import OCRResult
 
 
@@ -137,17 +135,10 @@ def _tokens_a_texto(ocr_tokens: list[OCRResult]) -> str:
 
 
 class LLMValidator:
-    """Extrae y valida campos de cheques usando un LLM local via Ollama."""
+    """Extrae y valida campos de cheques usando un LLM via backend intercambiable."""
 
-    def __init__(
-        self,
-        model: str = "llama3.2",
-        base_url: str = "http://localhost:11434",
-        timeout: int = 180,
-    ):
-        self._model = model
-        self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
+    def __init__(self, backend: LLMBackend):
+        self._backend = backend
 
     def extract_fields(
         self,
@@ -166,7 +157,7 @@ class LLMValidator:
             LLMExtractionResult.
         """
         user_message = self._build_user_message(ocr_tokens, batch_context or [])
-        raw_response = self._call_ollama(user_message)
+        raw_response = self._call_llm(user_message)
         if raw_response is None:
             return {"monto": _FAILED_RESULT, "fecha_emision": _FAILED_RESULT}
         return self._parse_response(raw_response)
@@ -191,33 +182,12 @@ class LLMValidator:
         )
         return "\n".join(partes)
 
-    def _call_ollama(self, user_message: str) -> str | None:
-        payload = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            "stream": False,
-            "options": {"temperature": 0.0},
-        }
-        try:
-            t0 = time.perf_counter()
-            response = httpx.post(
-                f"{self._base_url}/api/chat",
-                json=payload,
-                timeout=self._timeout,
-            )
-            elapsed = time.perf_counter() - t0
-            response.raise_for_status()
-            logger.info("LLM respondio en %.1fs", elapsed)
-            return response.json()["message"]["content"]
-        except httpx.ConnectError:
-            logger.warning("Ollama no disponible en %s", self._base_url)
-            return None
-        except Exception as exc:
-            logger.warning("Error llamando a Ollama: %s", exc)
-            return None
+    def _call_llm(self, user_message: str) -> str | None:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        return self._backend.chat(messages)
 
     def _parse_response(self, raw: str) -> dict[str, LLMExtractionResult]:
         # Extraer JSON aunque el LLM agregue texto extra
