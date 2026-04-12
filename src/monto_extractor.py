@@ -14,29 +14,42 @@ El lector OCR se inyecta via OCRReader, permitiendo usar docTR, Tesseract, EasyO
 import cv2
 import numpy as np
 import re
+from dataclasses import dataclass
 
-from .ocr_readers import OCRReader
+from .ocr_readers import OCRReader, OCRResult
+
+
+@dataclass
+class MontoOCRResult:
+    """Resultado del paso OCR de extraccion de monto."""
+    monto: float | None
+    monto_raw: str
+    monto_score: float
+    zona_tokens: list[OCRResult]  # tokens de zona_sup, para uso del validador LLM
 
 
 class MontoExtractor:
-    """Extrae el monto numerico de un cheque escaneado."""
+    """Extrae el monto numerico de un cheque escaneado via OCR heuristico."""
 
     def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
 
-    def extraer(self, cheque_img: np.ndarray) -> tuple[float | None, str, float]:
-        """Extrae el monto de un cheque.
+    def extraer(self, cheque_img: np.ndarray) -> MontoOCRResult:
+        """Extrae el monto de un cheque usando OCR + heuristicas.
+
+        Args:
+            cheque_img: Imagen RGB del cheque recortado.
 
         Returns:
-            (monto_float, monto_raw, score)
+            MontoOCRResult con monto normalizado, raw, score y tokens de zona.
         """
         h, w = cheque_img.shape[:2]
-        # candidatos: lista de (texto_monto, cerca_dolar_bool)
         candidatos = []
 
         # ---- Paso 1: Encontrar $ y recortar alrededor ----
         zona_sup = cheque_img[0:int(h * 0.40), int(w * 0.40):w]
-        textos_sup = self._ocr_read(zona_sup)
+        zona_sup_tokens = self._ocr.read(zona_sup)
+        textos_sup = [(r.text, r.confidence, r.cx, r.cy) for r in zona_sup_tokens]
         dolar_pos = self._encontrar_dolar(textos_sup)
 
         if dolar_pos:
@@ -59,25 +72,30 @@ class MontoExtractor:
                         candidatos.append((txt, True))
 
         # ---- Paso 2: Zonas fijas (siempre, complementa el paso 1) ----
-        if True:
-            for x_pct, y_fin in [(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)]:
-                zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
-                for prep_fn in [self._noop, self._otsu]:
-                    img = prep_fn(zona)
-                    for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
-                        candidatos.append((txt, False))
-                if any(self._score(t, d) >= 5.0 for t, d in candidatos):
-                    break
+        for x_pct, y_fin in [(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)]:
+            zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
+            for prep_fn in [self._noop, self._otsu]:
+                img = prep_fn(zona)
+                for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
+                    candidatos.append((txt, False))
+            if any(self._score(t, d) >= 5.0 for t, d in candidatos):
+                break
 
-        # ---- Elegir mejor ----
-        if not candidatos:
-            return None, "", -1
+        # ---- Elegir mejor candidato ----
+        if candidatos:
+            candidatos.sort(key=lambda c: self._score(c[0], c[1]), reverse=True)
+            mejor_txt, mejor_dolar = candidatos[0]
+            ocr_score = self._score(mejor_txt, mejor_dolar)
+            ocr_valor = self._normalizar(mejor_txt)
+        else:
+            mejor_txt, ocr_score, ocr_valor = "", -1, None
 
-        candidatos.sort(key=lambda c: self._score(c[0], c[1]), reverse=True)
-        mejor_txt, mejor_dolar = candidatos[0]
-        score = self._score(mejor_txt, mejor_dolar)
-        valor = self._normalizar(mejor_txt)
-        return valor, mejor_txt, score
+        return MontoOCRResult(
+            monto=ocr_valor,
+            monto_raw=mejor_txt,
+            monto_score=ocr_score,
+            zona_tokens=zona_sup_tokens,
+        )
 
     # ---- OCR ----
 
