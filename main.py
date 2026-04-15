@@ -9,12 +9,12 @@ logging.basicConfig(
     format="%(name)s: %(message)s",
 )
 
-from src.pdf_processor import pdf_a_imagenes, guardar_imagen
-from src.check_detector import detectar_cheques
-from src.cheque_extractor import ChequeExtractor
-from src.ocr_readers import DocTRReader
-from src.llm_backends import OllamaBackend
-from src.llm_validator import LLMValidator
+from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen
+from src.detection.check_detector import detectar_cheques
+from src.extractors.cheque_extractor import ChequeExtractor
+from src.ocr.ocr_readers import DocTRReader
+from src.llm.llm_backends import OllamaBackend
+from src.llm.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
 
