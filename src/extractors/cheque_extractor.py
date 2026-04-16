@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .fecha_emision_extractor import FechaEmisionExtractor
-from .models import DatosCheque
+from ..models import DatosCheque
 from .monto_extractor import MontoExtractor
-from .ocr_readers import OCRReader
+from ..ocr.ocr_readers import OCRReader
 
 if TYPE_CHECKING:
-    from .llm_validator import LLMValidator
+    from ..llm.llm_validator import LLMValidator
 
 logger = logging.getLogger(__name__)
 

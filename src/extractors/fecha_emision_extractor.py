@@ -9,7 +9,7 @@ import logging
 
 import numpy as np
 
-from .ocr_readers import OCRReader, OCRResult
+from ..ocr.ocr_readers import OCRReader, OCRResult
 
 logger = logging.getLogger(__name__)
 

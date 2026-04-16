@@ -12,16 +12,26 @@ C:\Folders\UNGS\PPS\Proyecto\
 ├── requirements.txt           # Dependencias
 ├── src/
 │   ├── __init__.py
-│   ├── pdf_processor.py       # Conversion PDF -> imagenes
-│   ├── check_detector.py      # Deteccion y recorte de cheques
-│   ├── monto_extractor.py     # Extraccion del monto con docTR
-│   └── models.py              # Modelo de datos y persistencia JSON
-├── output/
-│   ├── cheques.json           # Datos extraidos
-│   └── images/                # Imagenes recortadas de cada cheque
-└── docs/
-    ├── implementacion.md      # Este documento
-    └── pruebas_modelos.md     # Pruebas de modelos OCR
+│   ├── models.py                   # Modelo de datos y persistencia JSON
+│   ├── detection/
+│   │   └── check_detector.py       # Detección y recorte de cheques
+│   ├── extractors/
+│   │   ├── cheque_extractor.py     # Orquestador principal de extracción
+│   │   ├── monto_extractor.py      # Extracción del monto usando OCRReader
+│   │   └── fecha_emision_extractor.py # Extracción de fecha usando OCRReader
+│   ├── ocr/
+│   │   └── ocr_readers.py          # Abstracción de lectores OCR (docTR, Tesseract, etc.)
+│   ├── llm/
+│   │   ├── llm_backends.py         # Backends HTTP para LLMs (Ollama, etc.)
+│   │   └── llm_validator.py        # Validación de campos con LLM
+│   └── pdf/
+│       └── pdf_processor.py       # Conversión PDF -> imágenes
+├── output/     
+│   ├── cheques.json                # Datos extraidos
+│   └── images/                     # Imagenes recortadas de cada cheque
+└── docs/     
+    ├── implementacion.md           # Este documento
+    └── pruebas_modelos.md          # Pruebas de modelos OCR
 ```
 
 ## 3. Pipeline de procesamiento
@@ -41,11 +51,20 @@ PDF de entrada
 [3] Recorte y guardado de cada cheque como PNG
       |
       v
-[4] Extraccion del monto numerico (docTR)
+[4] OCR de zonas relevantes (abstraccion OCRReader)
+      |
+      +---> [4a] Extraccion de monto (heuristica + OCR)
+      |
+      +---> [4b] Extraccion de fecha (busqueda de tokens)
       |
       v
-[5] Normalizacion y guardado en JSON
+[5] Validacion/refinamiento con LLM (opcional)
+      |
+      v
+[6] Normalizacion y guardado en JSON
 ```
+
+**Nota:** Los pasos [4a], [4b] y [5] son coordinados por `ChequeExtractor`.
 
 ## 4. Detalle de cada modulo
 
@@ -81,16 +100,16 @@ Detecta los cheques individuales dentro de una pagina escaneada que puede conten
 
 ### 4.3 Extraccion de monto (`monto_extractor.py`)
 
-**Biblioteca utilizada:** docTR (python-doctr) con arquitectura db_resnet50 + crnn_vgg16_bn
+**Biblioteca utilizada:** docTR (python-doctr) con arquitectura db_resnet50 + crnn_vgg16_bn, accedida via abstraccion `OCRReader`
 
 Este es el modulo mas complejo del sistema. Extrae el monto numerico escrito a mano en el recuadro de la esquina superior derecha de cada cheque.
 
 #### Estrategia de extraccion (multi-fallback)
 
 **Paso 1 - Anclaje en el signo $:**
-- Se busca el simbolo `$` con docTR en la zona superior del cheque (40% superior, 60% derecho).
+- Se busca el simbolo `$` con OCR en la zona superior del cheque (40% superior, 60% derecho).
 - Si se encuentra, se recorta una zona alrededor del `$` (30% de margen vertical, 10% de margen a la izquierda).
-- Se ejecuta docTR sobre ese recorte con 3 variantes de preprocesamiento:
+- Se ejecuta OCR sobre ese recorte con 3 variantes de preprocesamiento:
   - Imagen cruda (sin procesar)
   - Binarizacion Otsu
   - Escalado x2 + binarizacion Otsu
@@ -100,12 +119,12 @@ Este es el modulo mas complejo del sistema. Extrae el monto numerico escrito a m
   - Zona chica: 63% derecho, 25% superior
   - Zona media: 58% derecho, 32% superior
   - Zona grande: 50% derecho, 40% superior
-- Cada zona se procesa con docTR crudo y con binarizacion Otsu.
+- Cada zona se procesa con OCR crudo y con binarizacion Otsu.
 - Si algun candidato alcanza un score de 5.0 o mas (formato con puntos de miles), se detiene la busqueda.
 
 #### Seleccion de candidatos (scoring)
 
-De todos los textos detectados por docTR, se filtran los que pueden ser montos:
+De todos los textos detectados por OCR, se filtran los que pueden ser montos:
 
 1. **Formato con puntos de miles** (ej: `2.500.000`, `1350.000`): reciben score base de 5.0. Son la deteccion mas confiable.
 2. **Numeros puros de 6+ digitos** (ej: `4000000`): reciben score base de 1.0, con penalizaciones:
@@ -130,15 +149,129 @@ El monto detectado se convierte a `float` siguiendo las convenciones argentinas:
 - La coma es separador decimal: `802.470,20` se convierte a `802470.20`
 - Los numeros sin formato se toman tal cual: `4000000` se convierte a `4000000.0`
 
-### 4.4 Modelo de datos y persistencia (`models.py`)
+### 4.4 Abstraccion de lectores OCR (`ocr_readers.py`)
+
+**Proposito:** Desacoplar la logica de extraccion de campos de la libreria OCR concreta (docTR, Tesseract, EasyOCR, etc.).
+
+Define una interfaz comun `OCRReader` que permite intercambiar implementaciones sin modificar `MontoExtractor` o `FechaEmisionExtractor`.
+
+#### Interfaz base
+
+```python
+class OCRReader(ABC):
+    def read(self, img: np.ndarray) -> list[OCRResult]:
+        """Lee texto de una imagen.
+        
+        Returns:
+            Lista de OCRResult con texto, confianza y posiciones normalizadas (0-1).
+        """
+        pass
+```
+
+#### OCRResult
+
+Cada token detectado es un `OCRResult` con:
+- `text`: Palabra detectada.
+- `confidence`: Score de confianza (0.0-1.0).
+- `cx`, `cy`: Centro normalizado del token en la imagen (0-1).
+
+#### Implementaciones disponibles
+
+1. **DocTRReader**: Usa docTR con arquitectura `db_resnet50 + crnn_vgg16_bn`. Implementacion por defecto, mas robusta.
+2. **TesseractReader**: Click alternativa con Tesseract (requiere binarios del sistema).
+3. **EasyOCRReader**: Opcion alternativa con EasyOCR.
+
+### 4.5 Extraccion de fecha de emision (`fecha_emision_extractor.py`)
+
+**Proposito:** Extraer la linea de fecha "CIUDAD, DD DE MES DE AAAA" del cheque.
+
+Utiliza un enfoque basado en tokens OCR mas que en procesamiento de imagen:
+
+1. **Escaneo de zona:** Lee tokens OCR de la franja superior-central del cheque (40-45% de alto), excluyendo el logo del banco (izq) y recuadro del monto (der).
+2. **Anclaje en "EL":** Busca el token "EL" (que siempre aparece en la linea siguente de la fecha: "EL DD DE MES DE AAAA" para pago). 
+3. **Filtrado:** Retorna solo los tokens entre el 30% inferior del header y la linea del "EL", que son los que constituyen la fecha de emision.
+
+El resultado es una lista de `OCRResult` que luego se envia al LLM para normalizacion a formato ISO.
+
+### 4.6 Backends de LLM (`llm_backends.py`)
+
+**Proposito:** Proporcionar una interfaz comun para diferentes backends de LLM.
+
+#### Interfaz base
+
+```python
+class LLMBackend(ABC):
+    def chat(self, messages: list[dict]) -> str | None:
+        """Envia mensajes al LLM y retorna la respuesta, o None si falla."""
+        pass
+```
+
+#### Implementacion disponible
+
+**OllamaBackend**: Conecta a un servidor Ollama local (`http://localhost:11434`) via POST `/api/chat`.
+- Parametros: `model` (default: `"llama3.2"`), `base_url`, `timeout` (180s).
+- Retorna la respuesta del LLM o `None` si hay timeout/error.
+
+### 4.7 Validacion y extraccion con LLM (`llm_validator.py`)
+
+**Proposito:** Usar un LLM para validar, corregir y extraer campos estructurados a partir de tokens OCR.
+
+Este modulo es **opcional** y mejora la precision cuando se consume bastante tiempo extra.
+
+#### Campos extraidos
+
+1. **monto**: Importe numerico en formato argentino (`"4.000.000"`, `"802.470,20"`).
+2. **fecha_emision**: Fecha en formato ISO (`"YYYY-MM-DD"`).
+
+#### Sistema de prompts
+
+El LLM recibe:
+- **Prompt del sistema:** Instrucciones detalladas sobre como leer cheques argentinos, formatos, convenciones de confianza.
+- **Tokens OCR del cheque:** Texto de todos los tokens (monto + fecha) en orden de lectura.
+- **Contexto del lote:** Opcional - montos raw de otros cheques del mismo lote, para ayudar a desambiguar anomalias.
+
+#### Scoring de confianza
+
+El LLM asigna un score de confianza (0.0-1.0) para cada campo:
+- **0.95-1.00:** Valor inequivoco, formato estandar reconocible.
+- **0.80-0.94:** Legible con algo de ruido OCR, reconstruccion segura.
+- **0.60-0.79:** Parcialmente reconstruido con contexto del lote.
+- **0.00-0.59:** El LLM esta adivinando, resultado no confiable.
+
+#### Estado de usar/no usar LLM
+
+`LLMValidator` es **opcional**. Si no se proporciona al `ChequeExtractor`, se usa solo la heuristica de OCR.
+
+Si si se proporciona y el LLM devuelve una confianza >= 0.70, se usa su resultado. Sino, se preserva el resultado del OCR heuristico.
+
+### 4.8 Orquestador principal (`cheque_extractor.py`)
+
+**Proposito:** Coordinar `MontoExtractor`, `FechaEmisionExtractor` y `LLMValidator` para producir un `DatosCheque` completo.
+
+#### Flujo de `ChequeExtractor.extraer()`
+
+1. **OCR heuristico**: Extrae monto (heuristica + OCR) y tokens de fecha.
+2. **LLM opcional**: Si `LLMValidator` esta disponible, envia todos los tokens al LLM para refinamiento.
+3. **Decision de valores finales**:
+   - Si LLM confiance >= 0.70, usa resultado del LLM.
+   - Sino, preserva resultado del OCR heuristico.
+4. **Retorna**: `DatosCheque` con todos los campos + scores de confianza.
+
+Esto permite un flujo hibrido: OCR rapido para velocidad, LLM opcional para precision.
+
+### 4.9 Modelo de datos y persistencia (`models.py`)
 
 Se define un `dataclass` llamado `DatosCheque` con los siguientes campos:
 
 | Campo | Tipo | Descripcion |
 |-------|------|-------------|
-| `monto` | `float` o `None` | Monto normalizado como valor numerico |
-| `monto_raw` | `str` | Texto crudo tal como lo leyo el OCR |
-| `monto_score` | `float` | Puntaje de confianza de la deteccion |
+| `monto` | `float` o `None` | Monto normalizado como valor numerico (OCR heuristico o LLM) |
+| `monto_raw` | `str` | Texto crudo tal como lo leyo el OCR/LLM |
+| `monto_score` | `float` | Puntaje de confianza de la deteccion heuristica |
+| `monto_llm_confidence` | `float` o `None` | Score de confianza del LLM (0.0-1.0) si disponible |
+| `fecha_emision` | `str` o `None` | Fecha de emision en formato ISO (`YYYY-MM-DD`) si se extrajo |
+| `fecha_emision_raw` | `str` o `None` | Texto crudo de la fecha segun el LLM |
+| `fecha_emision_llm_confidence` | `float` o `None` | Score de confianza del LLM para la fecha |
 | `imagen_path` | `str` | Ruta a la imagen recortada del cheque |
 | `pdf_origen` | `str` | Nombre del archivo PDF de origen |
 | `pagina` | `int` | Numero de pagina dentro del PDF |
@@ -153,6 +286,10 @@ Los datos se persisten en un archivo JSON con la estructura:
       "monto": 2500000.0,
       "monto_raw": "2.500.000",
       "monto_score": 5.35,
+      "monto_llm_confidence": 0.98,
+      "fecha_emision": "2026-02-15",
+      "fecha_emision_raw": "15 DE Febrero DE 2026",
+      "fecha_emision_llm_confidence": 0.95,
       "imagen_path": "output\\images\\Scan CH1_p1_ch1.png",
       "pdf_origen": "Scan CH1.pdf",
       "pagina": 1,
@@ -162,7 +299,7 @@ Los datos se persisten en un archivo JSON con la estructura:
 }
 ```
 
-### 4.5 Interfaz de linea de comandos (`main.py`)
+### 4.10 Interfaz de linea de comandos (`main.py`)
 
 El programa ofrece tres comandos:
 
@@ -191,22 +328,36 @@ python main.py buscar "termino"
 | Pillow | >= 11.0.0 | Manipulacion de imagenes |
 | numpy | >= 1.26.0 | Operaciones con arrays de imagenes |
 | tqdm | >= 4.66.0 | Barra de progreso |
+| pytesseract | >= 0.3.10 | OCR alternativa (opcional) |
+| httpx | >= 0.27.0 | Cliente HTTP para backends LLM (Ollama) |
 
-Todo el procesamiento es **local**. Los modelos de docTR se descargan una sola vez desde HuggingFace al primer uso y quedan cacheados en disco.
+Todo el procesamiento es **local**. Los modelos de docTR se descargan una sola vez desde HuggingFace al primer uso y quedan cacheados en disco. LLM es opcional y requiere un servidor local (ej. Ollama).
 
 ## 6. Resultados actuales
 
-Sobre 12 cheques de prueba (4 PDFs, 3 cheques por pagina, 6 bancos distintos):
+Sobre los 12 cheques de prueba (4 PDFs, 3 cheques por pagina, 6 bancos distintos):
 
+**Extraccion de monto (OCR heuristico):**
 - **Deteccion de cheques:** 12/12 (100%)
 - **Extraccion de monto exacto:** 8/12 (67%)
 - **Extraccion de monto parcial** (orden de magnitud correcto): 10/12 (83%)
+- Los 8 aciertos exactos tienen un score de confianza >= 1.3, lo cual permite al usuario filtrar resultados confiables.
 
-Los 8 aciertos exactos tienen un score de confianza >= 1.3, lo cual permite al usuario filtrar resultados confiables.
+**Extraccion de fecha de emision (con LLM):**
+- Extraccion exitosa con Ollama + llama3.2 en todos los cheques validados.
+- Scores de confianza tipicos: 0.85-0.99 (muy alta precision).
 
 ## 7. Limitaciones conocidas
 
+**OCR heuristico (monto):**
 1. **Caligrafia muy irregular:** Cuando el monto esta escrito con letra muy desprolija o hay firmas superpuestas, el OCR puede fallar.
 2. **Montos sin formato de puntos de miles:** Montos chicos como `$4.215` que no llevan puntos de miles son mas dificiles de distinguir de otros numeros en el cheque.
 3. **Decimales separados:** Cuando el OCR detecta los centavos como un texto separado del monto entero, no siempre se concatenan correctamente (ej: `802.470` sin los `,20`).
-4. **Velocidad:** El procesamiento toma aproximadamente 4-6 segundos por cheque en CPU (sin GPU).
+
+**LLM (fecha, validacion):**
+4. **Dependencia externa:** La extraccion de fecha requiere un servidor LLM externo (ej. Ollama). Sin LLM, solo se extraen montos.
+5. **Latencia:** Usar LLM agrega muchisimo tiempo: ~20-30 segundos por cheque en CPU (vs ~4-6 seg con OCR puro). Se recomienda usar LLM solo cuando la precision sea critica.
+6. **Modelos variables:** La calidad depends del modelo LLM utilizado. Modelos mas pequenos pueden tener precision baja.
+
+**General:**
+7. **Velocidad sin GPU:** El procesamiento OCR toma aproximadamente 4-6 segundos por cheque en CPU (sin GPU).

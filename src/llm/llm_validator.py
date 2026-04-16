@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .llm_backends import LLMBackend
-from .ocr_readers import OCRResult
+from ..ocr.ocr_readers import OCRResult
 
 
 logger = logging.getLogger(__name__)

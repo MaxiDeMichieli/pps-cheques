@@ -16,7 +16,7 @@ import numpy as np
 import re
 from dataclasses import dataclass
 
-from .ocr_readers import OCRReader, OCRResult
+from ..ocr.ocr_readers import OCRReader, OCRResult
 
 
 @dataclass
