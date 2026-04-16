@@ -15,6 +15,15 @@ class DatosCheque:
     # Monto (LLM)
     monto_llm_confidence: float | None = None
 
+    # Monto manuscrito (del campo "LA CANTIDAD DE PESOS")
+    monto_manuscrito: float | None = None
+    monto_manuscrito_raw: str | None = None
+    monto_manuscrito_score: float = 2.0
+    monto_manuscrito_confidence_ocr: float = 0.0
+    monto_inconsistencia_pct: float | None = None
+    monto_manuscrito_zona_base64: str | None = None
+    validacion_alineada: bool = False
+
     # Fecha de emision (LLM)
     fecha_emision: str | None = None        # ISO: "YYYY-MM-DD"
     fecha_emision_raw: str | None = None    # tal como lo leyo el LLM

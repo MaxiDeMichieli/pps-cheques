@@ -14,7 +14,8 @@ El lector OCR se inyecta via OCRReader, permitiendo usar docTR, Tesseract, EasyO
 import cv2
 import numpy as np
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
 
@@ -26,13 +27,29 @@ class MontoOCRResult:
     monto_raw: str
     monto_score: float
     zona_tokens: list[OCRResult]  # tokens de zona_sup, para uso del validador LLM
+    
+    # Campos de monto manuscrito (agregados por ManuscritoExtractor)
+    monto_manuscrito: Optional[float] = None
+    monto_manuscrito_raw: Optional[str] = None
+    monto_manuscrito_score: float = 2.0
+    monto_manuscrito_confidence_ocr: float = 0.0
+    monto_inconsistencia_pct: Optional[float] = None
+    monto_manuscrito_zona_base64: Optional[str] = None
+    validacion_alineada: bool = False
 
 
 class MontoExtractor:
     """Extrae el monto numerico de un cheque escaneado via OCR heuristico."""
 
-    def __init__(self, ocr_reader: OCRReader):
+    def __init__(self, ocr_reader: OCRReader, manuscrito_extractor=None):
+        """Inicializa extractor de monto.
+        
+        Args:
+            ocr_reader: Implementación de OCRReader.
+            manuscrito_extractor: (Opcional) ManuscritoExtractor para combinar con manuscritos.
+        """
         self._ocr = ocr_reader
+        self._manuscrito_extractor = manuscrito_extractor
 
     def extraer(self, cheque_img: np.ndarray) -> MontoOCRResult:
         """Extrae el monto de un cheque usando OCR + heuristicas.
@@ -96,6 +113,37 @@ class MontoExtractor:
             monto_score=ocr_score,
             zona_tokens=zona_sup_tokens,
         )
+
+    def extraer_con_manuscrito(self, cheque_img: np.ndarray) -> MontoOCRResult:
+        """Extrae monto numérico Y monto manuscrito, combinando resultados.
+        
+        Usa ManuscritoExtractor si fue inyectado en __init__.
+        
+        Args:
+            cheque_img: Imagen RGB del cheque recortado.
+        
+        Returns:
+            MontoOCRResult con campos numéricos y manuscritos combinados.
+        """
+        # Paso 1: Extraer monto numérico (zona superior derecha con $)
+        resultado_numerico = self.extraer(cheque_img)
+        
+        # Paso 2: Extraer monto manuscrito (zona centro-izquierda)
+        if self._manuscrito_extractor:
+            resultado_manuscrito = self._manuscrito_extractor.extraer(
+                cheque_img,
+                monto_numerico=resultado_numerico.monto,
+            )
+            # Combinar campos manuscritos en resultado
+            resultado_numerico.monto_manuscrito = resultado_manuscrito.monto_manuscrito
+            resultado_numerico.monto_manuscrito_raw = resultado_manuscrito.monto_manuscrito_raw
+            resultado_numerico.monto_manuscrito_score = resultado_manuscrito.monto_manuscrito_score
+            resultado_numerico.monto_manuscrito_confidence_ocr = resultado_manuscrito.monto_manuscrito_confidence_ocr
+            resultado_numerico.monto_inconsistencia_pct = resultado_manuscrito.monto_inconsistencia_pct
+            resultado_numerico.monto_manuscrito_zona_base64 = resultado_manuscrito.monto_manuscrito_zona_base64
+            resultado_numerico.validacion_alineada = resultado_manuscrito.validacion_alineada
+        
+        return resultado_numerico
 
     # ---- OCR ----
 
