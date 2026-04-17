@@ -7,8 +7,10 @@ al "CIUDAD, DD DE MES DE AAAA" de emision).
 
 import logging
 import re
+from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
 
@@ -40,7 +42,7 @@ class FechaEmisionExtractor:
     def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
 
-    def leer_tokens(self, cheque_img: np.ndarray) -> list[OCRResult]:
+    def leer_tokens(self, cheque_img: np.ndarray, debug_dir: Path | None = None) -> list[OCRResult]:
         """Devuelve tokens OCR de la zona de fecha.
 
         Escanea la franja superior-central (donde aparece la linea
@@ -50,6 +52,7 @@ class FechaEmisionExtractor:
 
         Args:
             cheque_img: Imagen RGB del cheque recortado.
+            debug_dir: Si se provee, guarda la zona de fecha como imagen.
 
         Returns:
             Lista de OCRResult de la linea de fecha unicamente.
@@ -58,6 +61,8 @@ class FechaEmisionExtractor:
         # Excluye el logo del banco (izq), el header impreso (arriba),
         # y el recuadro de monto/nro de cheque (der, cortamos en 0.70)
         zona = cheque_img[0:int(h * 0.45), int(w * 0.15):int(w * 0.70)]
+        if debug_dir is not None:
+            Image.fromarray(zona).save(debug_dir / "fecha_zona.png")
         tokens = self._ocr.read(zona)
 
         # Buscar "EL" como ancla: la fecha de emision esta en la fila anterior

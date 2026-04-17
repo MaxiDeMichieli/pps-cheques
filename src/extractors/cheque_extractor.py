@@ -6,6 +6,7 @@ un DatosCheque completo a partir de la imagen de un cheque.
 
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -37,6 +38,7 @@ class ChequeExtractor:
         self,
         cheque_img: np.ndarray,
         batch_context: list[str] | None = None,
+        debug_dir: Path | None = None,
     ) -> DatosCheque:
         """Extrae monto y fecha_emision de un cheque.
 
@@ -49,8 +51,8 @@ class ChequeExtractor:
         """
         # ---- OCR ----
         t0 = time.perf_counter()
-        monto_result = self._monto_ext.extraer(cheque_img)
-        fecha_tokens = self._fecha_ext.leer_tokens(cheque_img)
+        monto_result = self._monto_ext.extraer(cheque_img, debug_dir=debug_dir)
+        fecha_tokens = self._fecha_ext.leer_tokens(cheque_img, debug_dir=debug_dir)
         ocr_elapsed = time.perf_counter() - t0
         logger.info(
             "OCR zonas (monto=%d, fecha=%d tokens): %.1fs",

@@ -27,10 +27,15 @@ def _extraer_de_imagen(
     pdf_name: str,
     extractor: ChequeExtractor,
     batch_montos_raw: list[str],
+    debug_dir: Path | None = None,
 ) -> DatosCheque:
     cheque_img = cargar_imagen(ruta_img)
+    cheque_debug_dir = None
+    if debug_dir is not None:
+        cheque_debug_dir = debug_dir / f"{Path(pdf_name).stem}_p{num_pag}_ch{idx}"
+        cheque_debug_dir.mkdir(exist_ok=True)
     print(f"    Cheque {idx}...", end=" ", flush=True)
-    datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw)
+    datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw, debug_dir=cheque_debug_dir)
     datos.imagen_path = ruta_img
     datos.pdf_origen = pdf_name
     datos.pagina = num_pag
@@ -47,6 +52,7 @@ def procesar_pdf(
     pdf_path: str,
     extractor: ChequeExtractor,
     output_dir: str = "output",
+    debug_dir: Path | None = None,
 ) -> list[DatosCheque]:
     """Procesa un PDF con cheques escaneados, reutilizando imagenes si ya existen."""
     pdf_path = Path(pdf_path)
@@ -68,7 +74,7 @@ def procesar_pdf(
         for img_path in existing:
             m = re.search(r"_p(\d+)_ch(\d+)\.png$", img_path.name)
             num_pag, idx = int(m.group(1)), int(m.group(2))
-            datos = _extraer_de_imagen(str(img_path), num_pag, idx, pdf_path.name, extractor, batch_montos_raw)
+            datos = _extraer_de_imagen(str(img_path), num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
             cheques_datos.append(datos)
         return cheques_datos
 
@@ -83,7 +89,7 @@ def procesar_pdf(
             nombre_img = f"{pdf_path.stem}_p{num_pag}_ch{idx}.png"
             ruta_img = str(img_dir / nombre_img)
             guardar_imagen(cheque_img, ruta_img)
-            datos = _extraer_de_imagen(ruta_img, num_pag, idx, pdf_path.name, extractor, batch_montos_raw)
+            datos = _extraer_de_imagen(ruta_img, num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
             cheques_datos.append(datos)
 
     return cheques_datos
@@ -117,11 +123,17 @@ def cmd_procesar(args):
         print(f"Error: {ruta} no es un PDF ni un directorio")
         return
 
+    debug_dir: Path | None = None
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        debug_dir = Path(args.output) / "debug"
+        debug_dir.mkdir(exist_ok=True)
+
     fecha_proceso = datetime.now().isoformat(timespec="seconds")
     runs = []
     total = 0
     for pdf in pdfs:
-        cheques = procesar_pdf(str(pdf), extractor, args.output)
+        cheques = procesar_pdf(str(pdf), extractor, args.output, debug_dir)
         runs.append({
             "fecha_proceso": fecha_proceso,
             "nombre_archivo": pdf.name,
@@ -197,6 +209,8 @@ def main():
                         help="Modelo Ollama a usar (default: llama3.2)")
     p_proc.add_argument("--llm-url", default="http://localhost:11434",
                         help="URL del servidor Ollama (default: http://localhost:11434)")
+    p_proc.add_argument("--debug", action="store_true",
+                        help="Activar logging DEBUG y guardar imagenes intermedias en output/debug/")
     p_proc.set_defaults(func=cmd_procesar)
 
     p_list = subparsers.add_parser("listar", help="Listar cheques procesados")

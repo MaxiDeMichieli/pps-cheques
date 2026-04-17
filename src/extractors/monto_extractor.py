@@ -15,6 +15,9 @@ import cv2
 import numpy as np
 import re
 from dataclasses import dataclass
+from pathlib import Path
+
+from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
 
@@ -34,11 +37,12 @@ class MontoExtractor:
     def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
 
-    def extraer(self, cheque_img: np.ndarray) -> MontoOCRResult:
+    def extraer(self, cheque_img: np.ndarray, debug_dir: Path | None = None) -> MontoOCRResult:
         """Extrae el monto de un cheque usando OCR + heuristicas.
 
         Args:
             cheque_img: Imagen RGB del cheque recortado.
+            debug_dir: Si se provee, guarda imagenes intermedias en ese directorio.
 
         Returns:
             MontoOCRResult con monto normalizado, raw, score y tokens de zona.
@@ -46,8 +50,13 @@ class MontoExtractor:
         h, w = cheque_img.shape[:2]
         candidatos = []
 
+        def _save(img: np.ndarray, name: str):
+            if debug_dir is not None:
+                Image.fromarray(img).save(debug_dir / name)
+
         # ---- Paso 1: Encontrar $ y recortar alrededor ----
         zona_sup = cheque_img[0:int(h * 0.40), int(w * 0.40):w]
+        _save(zona_sup, "monto_zona_sup.png")
         zona_sup_tokens = self._ocr.read(zona_sup)
         textos_sup = [(r.text, r.confidence, r.cx, r.cy) for r in zona_sup_tokens]
         dolar_pos = self._encontrar_dolar(textos_sup)
@@ -66,14 +75,20 @@ class MontoExtractor:
             ]
 
             if crop.size > 0:
-                for prep_fn in [self._noop, self._otsu, self._x2_otsu]:
+                for prep_fn, label in [
+                    (self._noop, "monto_dollar_crop_raw.png"),
+                    (self._otsu, "monto_dollar_crop_otsu.png"),
+                    (self._x2_otsu, "monto_dollar_crop_x2otsu.png"),
+                ]:
                     img = prep_fn(crop)
+                    _save(img, label)
                     for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=True):
                         candidatos.append((txt, True))
 
         # ---- Paso 2: Zonas fijas (siempre, complementa el paso 1) ----
-        for x_pct, y_fin in [(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)]:
+        for i, (x_pct, y_fin) in enumerate([(0.63, 0.25), (0.58, 0.32), (0.50, 0.40)], 1):
             zona = cheque_img[0:int(h * y_fin), int(w * x_pct):w]
+            _save(zona, f"monto_fixed_z{i}.png")
             for prep_fn in [self._noop, self._otsu]:
                 img = prep_fn(zona)
                 for txt in self._extraer_montos(self._ocr_read(img), cerca_dolar=False):
