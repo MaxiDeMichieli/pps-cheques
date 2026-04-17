@@ -2,6 +2,8 @@
 
 import argparse
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 
 logging.basicConfig(
@@ -9,7 +11,7 @@ logging.basicConfig(
     format="%(name)s: %(message)s",
 )
 
-from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen
+from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen, cargar_imagen
 from src.detection.check_detector import detectar_cheques
 from src.extractors.cheque_extractor import ChequeExtractor
 from src.ocr.ocr_readers import DocTRReader
@@ -18,23 +20,66 @@ from src.llm.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
 
 
+def _extraer_de_imagen(
+    ruta_img: str,
+    num_pag: int,
+    idx: int,
+    pdf_name: str,
+    extractor: ChequeExtractor,
+    batch_montos_raw: list[str],
+    debug_dir: Path | None = None,
+) -> DatosCheque:
+    cheque_img = cargar_imagen(ruta_img)
+    cheque_debug_dir = None
+    if debug_dir is not None:
+        cheque_debug_dir = debug_dir / f"{Path(pdf_name).stem}_p{num_pag}_ch{idx}"
+        cheque_debug_dir.mkdir(exist_ok=True)
+    print(f"    Cheque {idx}...", end=" ", flush=True)
+    datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw, debug_dir=cheque_debug_dir)
+    datos.imagen_path = ruta_img
+    datos.pdf_origen = pdf_name
+    datos.pagina = num_pag
+    datos.indice_en_pagina = idx
+    batch_montos_raw.append(datos.monto_raw)
+    monto_str = f"${datos.monto:,.2f}" if datos.monto else "no detectado"
+    conf_str = f" llm={datos.monto_llm_confidence:.2f}" if datos.monto_llm_confidence is not None else ""
+    fecha_str = f" fecha={datos.fecha_emision}" if datos.fecha_emision else ""
+    print(f"Monto: {monto_str} (score={datos.monto_score:.1f}{conf_str}{fecha_str})")
+    return datos
+
+
 def procesar_pdf(
     pdf_path: str,
     extractor: ChequeExtractor,
     output_dir: str = "output",
+    debug_dir: Path | None = None,
 ) -> list[DatosCheque]:
-    """Procesa un PDF con cheques escaneados."""
+    """Procesa un PDF con cheques escaneados, reutilizando imagenes si ya existen."""
     pdf_path = Path(pdf_path)
     img_dir = Path(output_dir) / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Procesando: {pdf_path.name}")
 
+    existing = sorted(
+        img_dir.glob(f"{pdf_path.stem}_p*_ch*.png"),
+        key=lambda p: tuple(int(x) for x in re.search(r"_p(\d+)_ch(\d+)\.png$", p.name).groups()),
+    )
+
+    cheques_datos: list[DatosCheque] = []
+    batch_montos_raw: list[str] = []
+
+    if existing:
+        print(f"  Reutilizando {len(existing)} imagenes existentes")
+        for img_path in existing:
+            m = re.search(r"_p(\d+)_ch(\d+)\.png$", img_path.name)
+            num_pag, idx = int(m.group(1)), int(m.group(2))
+            datos = _extraer_de_imagen(str(img_path), num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
+            cheques_datos.append(datos)
+        return cheques_datos
+
     paginas = pdf_a_imagenes(str(pdf_path), dpi=300)
     print(f"  Paginas: {len(paginas)}")
-
-    cheques_datos = []
-    batch_montos_raw: list[str] = []
 
     for num_pag, pagina in enumerate(paginas, 1):
         cheques_img = detectar_cheques(pagina)
@@ -44,22 +89,8 @@ def procesar_pdf(
             nombre_img = f"{pdf_path.stem}_p{num_pag}_ch{idx}.png"
             ruta_img = str(img_dir / nombre_img)
             guardar_imagen(cheque_img, ruta_img)
-
-            print(f"    Cheque {idx}...", end=" ", flush=True)
-
-            datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw)
-            datos.imagen_path = ruta_img
-            datos.pdf_origen = pdf_path.name
-            datos.pagina = num_pag
-            datos.indice_en_pagina = idx
-
-            batch_montos_raw.append(datos.monto_raw)
+            datos = _extraer_de_imagen(ruta_img, num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
             cheques_datos.append(datos)
-
-            monto_str = f"${datos.monto:,.2f}" if datos.monto else "no detectado"
-            conf_str = f" llm={datos.monto_llm_confidence:.2f}" if datos.monto_llm_confidence is not None else ""
-            fecha_str = f" fecha={datos.fecha_emision}" if datos.fecha_emision else ""
-            print(f"Monto: {monto_str} (score={datos.monto_score:.1f}{conf_str}{fecha_str})")
 
     return cheques_datos
 
@@ -92,16 +123,29 @@ def cmd_procesar(args):
         print(f"Error: {ruta} no es un PDF ni un directorio")
         return
 
-    todos_cheques = []
+    debug_dir: Path | None = None
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        debug_dir = Path(args.output) / "debug"
+        debug_dir.mkdir(exist_ok=True)
+
+    fecha_proceso = datetime.now().isoformat(timespec="seconds")
+    runs = []
+    total = 0
     for pdf in pdfs:
-        cheques = procesar_pdf(str(pdf), extractor, args.output)
-        todos_cheques.extend(cheques)
+        cheques = procesar_pdf(str(pdf), extractor, args.output, debug_dir)
+        runs.append({
+            "fecha_proceso": fecha_proceso,
+            "nombre_archivo": pdf.name,
+            "cheques": [ch.to_dict() for ch in cheques],
+        })
+        total += len(cheques)
         print()
 
     json_path = Path(args.output) / "cheques.json"
-    guardar_cheques_json(todos_cheques, str(json_path))
+    guardar_cheques_json(runs, str(json_path))
     print(f"Resultados guardados en: {json_path}")
-    print(f"Total cheques procesados: {len(todos_cheques)}")
+    print(f"Total cheques procesados: {total}")
 
 
 def cmd_listar(args):
@@ -111,7 +155,8 @@ def cmd_listar(args):
         print(f"No se encontro {json_path}. Procese algun PDF primero.")
         return
 
-    cheques = cargar_cheques_json(str(json_path))
+    runs = cargar_cheques_json(str(json_path))
+    cheques = [ch for run in runs for ch in run.get("cheques", [])]
     print(f"Total cheques: {len(cheques)}\n")
 
     for i, ch in enumerate(cheques, 1):
@@ -129,7 +174,8 @@ def cmd_buscar(args):
         print(f"No se encontro {json_path}. Procese algun PDF primero.")
         return
 
-    cheques = cargar_cheques_json(str(json_path))
+    runs = cargar_cheques_json(str(json_path))
+    cheques = [ch for run in runs for ch in run.get("cheques", [])]
     termino = args.termino.lower()
     encontrados = []
 
@@ -163,6 +209,8 @@ def main():
                         help="Modelo Ollama a usar (default: llama3.2)")
     p_proc.add_argument("--llm-url", default="http://localhost:11434",
                         help="URL del servidor Ollama (default: http://localhost:11434)")
+    p_proc.add_argument("--debug", action="store_true",
+                        help="Activar logging DEBUG y guardar imagenes intermedias en output/debug/")
     p_proc.set_defaults(func=cmd_procesar)
 
     p_list = subparsers.add_parser("listar", help="Listar cheques procesados")

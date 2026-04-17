@@ -156,6 +156,9 @@ class LLMValidator:
             Dict con claves "monto" y "fecha_emision", cada una con un
             LLMExtractionResult.
         """
+        tokens_txt = _tokens_a_texto(ocr_tokens)
+        logger.info("OCR tokens: %s", tokens_txt)
+
         user_message = self._build_user_message(ocr_tokens, batch_context or [])
         raw_response = self._call_llm(user_message)
         if raw_response is None:

@@ -33,3 +33,8 @@ def pdf_a_imagenes(pdf_path: str, dpi: int = 300) -> list[np.ndarray]:
 def guardar_imagen(imagen: np.ndarray, path: str):
     """Guarda un numpy array como imagen PNG."""
     Image.fromarray(imagen).save(path)
+
+
+def cargar_imagen(path: str) -> np.ndarray:
+    """Carga una imagen PNG como numpy array RGB."""
+    return np.array(Image.open(path).convert("RGB"))
