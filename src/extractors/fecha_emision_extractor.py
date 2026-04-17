@@ -6,6 +6,7 @@ al "CIUDAD, DD DE MES DE AAAA" de emision).
 """
 
 import logging
+import re
 
 import numpy as np
 
@@ -13,9 +14,28 @@ from ..ocr.ocr_readers import OCRReader, OCRResult
 
 logger = logging.getLogger(__name__)
 
+_MESES_NOMBRES = {
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+}
+
+
+def _es_token_fecha(text: str) -> bool:
+    """Indica si un token pertenece tipicamente a la linea de ciudad+fecha."""
+    t = text.strip().lower()
+    if t in _MESES_NOMBRES:
+        return True
+    # Año: 4 digitos entre 2000-2099
+    if re.match(r'^20\d{2}$', t):
+        return True
+    return False
+
 
 class FechaEmisionExtractor:
     """Lee los tokens OCR de la zona de fecha de emision."""
+
+    # Tolerancia vertical para agrupar tokens en la misma fila (en cy normalizado)
+    _FILA_TOLERANCIA = 0.06
 
     def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
@@ -24,18 +44,20 @@ class FechaEmisionExtractor:
         """Devuelve tokens OCR de la zona de fecha.
 
         Escanea la franja superior-central (donde aparece la linea
-        "CIUDAD, DD DE MES DE AAAA") y usa el token "EL" como limite inferior,
-        ya que la linea de fecha siempre esta encima del "EL DD DE MES" de pago.
+        "CIUDAD, DD DE MES DE AAAA") y usa el token "EL" como limite inferior.
+        El limite derecho se recorta antes del recuadro de monto/numero de cheque.
+        Solo devuelve los tokens de la fila exacta donde se detecta la fecha.
 
         Args:
             cheque_img: Imagen RGB del cheque recortado.
 
         Returns:
-            Lista de OCRResult de la zona de fecha, filtrada por posicion.
+            Lista de OCRResult de la linea de fecha unicamente.
         """
         h, w = cheque_img.shape[:2]
-        # Franja superior, dejando el logo del banco (izq) y el recuadro del monto (der)
-        zona = cheque_img[0:int(h * 0.45), int(w * 0.15):int(w * 0.80)]
+        # Excluye el logo del banco (izq), el header impreso (arriba),
+        # y el recuadro de monto/nro de cheque (der, cortamos en 0.70)
+        zona = cheque_img[0:int(h * 0.45), int(w * 0.15):int(w * 0.70)]
         tokens = self._ocr.read(zona)
 
         # Buscar "EL" como ancla: la fecha de emision esta en la fila anterior
@@ -43,22 +65,38 @@ class FechaEmisionExtractor:
             (t for t in tokens if t.text.strip().upper() == "EL"),
             None,
         )
+        cy_max = el_token.cy - 0.05 if el_token else 1.0
 
+        tokens_sobre_el = [t for t in tokens if t.cy < cy_max]
+
+        # Buscar tokens que pertenezcan a la linea de fecha (mes o año)
+        fecha_anclas = [t for t in tokens_sobre_el if _es_token_fecha(t.text)]
+
+        if fecha_anclas:
+            cy_fila = sum(t.cy for t in fecha_anclas) / len(fecha_anclas)
+            resultado = [
+                t for t in tokens_sobre_el
+                if abs(t.cy - cy_fila) < self._FILA_TOLERANCIA
+            ]
+            logger.info(
+                "Fila de fecha detectada en cy=%.2f -> %d tokens",
+                cy_fila, len(resultado),
+            )
+            return resultado
+
+        # Fallback: banda estrecha justo encima del EL
         if el_token:
-            # Banda entre el 30% inferior del header y la fila del EL:
-            # - limite superior (0.30): descarta encabezado del cheque (nro. serie, tipo)
-            # - limite inferior (el_cy - 0.05): descarta el EL y lo que sigue
-            cy_min = el_token.cy * 0.30
-            cy_max = el_token.cy - 0.05
-            tokens = [t for t in tokens if cy_min < t.cy < cy_max]
+            resultado = [
+                t for t in tokens_sobre_el
+                if t.cy > cy_max - 0.20
+            ]
             logger.info(
-                "Ancla 'EL' en cy=%.2f -> %d tokens de fecha",
-                el_token.cy, len(tokens),
+                "Ancla de fecha no encontrada, fallback banda sobre EL -> %d tokens",
+                len(resultado),
             )
-        else:
-            logger.info(
-                "Ancla 'EL' no encontrada, usando zona completa (%d tokens)",
-                len(tokens),
-            )
+            return resultado
 
-        return tokens
+        logger.info(
+            "Sin anclas, devolviendo zona completa (%d tokens)", len(tokens_sobre_el)
+        )
+        return tokens_sobre_el
