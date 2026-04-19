@@ -127,7 +127,13 @@ def cmd_procesar(args):
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         debug_dir = Path(args.output) / "debug"
-        debug_dir.mkdir(exist_ok=True)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        log_file = debug_dir / "debug.log"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger().info("Logging to %s", log_file)
 
     fecha_proceso = datetime.now().isoformat(timespec="seconds")
     runs = []

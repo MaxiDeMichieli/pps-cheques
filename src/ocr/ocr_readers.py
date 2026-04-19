@@ -11,13 +11,14 @@ import numpy as np
 
 class OCRResult:
     """Resultado de una palabra detectada por OCR."""
-    __slots__ = ('text', 'confidence', 'cx', 'cy')
+    __slots__ = ('text', 'confidence', 'cx', 'cy', 'height')
 
-    def __init__(self, text: str, confidence: float, cx: float, cy: float):
+    def __init__(self, text: str, confidence: float, cx: float, cy: float, height: float = 0.0):
         self.text = text
         self.confidence = confidence
-        self.cx = cx  # Centro X normalizado (0-1)
-        self.cy = cy  # Centro Y normalizado (0-1)
+        self.cx = cx      # Centro X normalizado (0-1)
+        self.cy = cy      # Centro Y normalizado (0-1)
+        self.height = height  # Alto del bounding box normalizado (0-1)
 
     def __iter__(self):
         """Permite desempaquetar como tupla: text, conf, cx, cy = result"""
@@ -67,7 +68,8 @@ class DocTRReader(OCRReader):
                         geo = word.geometry
                         cx = (geo[0][0] + geo[1][0]) / 2
                         cy = (geo[0][1] + geo[1][1]) / 2
-                        palabras.append(OCRResult(word.value, word.confidence, cx, cy))
+                        height = geo[1][1] - geo[0][1]
+                        palabras.append(OCRResult(word.value, word.confidence, cx, cy, height))
         return palabras
 
 
@@ -89,7 +91,7 @@ class TesseractReader(OCRReader):
                 conf = float(data['conf'][i]) / 100.0 if data['conf'][i] != -1 else 0.0
                 x = data['left'][i] + data['width'][i] / 2
                 y = data['top'][i] + data['height'][i] / 2
-                palabras.append(OCRResult(text, conf, x / w, y / h))
+                palabras.append(OCRResult(text, conf, x / w, y / h, data['height'][i] / h))
         return palabras
 
 
@@ -108,5 +110,6 @@ class EasyOCRReader(OCRReader):
             # bbox es [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
             cx = sum(p[0] for p in bbox) / 4 / w
             cy = sum(p[1] for p in bbox) / 4 / h
-            palabras.append(OCRResult(text, conf, cx, cy))
+            height = (bbox[2][1] - bbox[0][1]) / h
+            palabras.append(OCRResult(text, conf, cx, cy, height))
         return palabras
