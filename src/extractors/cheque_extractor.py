@@ -29,9 +29,10 @@ class ChequeExtractor:
         self,
         ocr_reader: OCRReader,
         llm_validator: "LLMValidator | None" = None,
+        crop_ocr_reader: "OCRReader | None" = None,
     ):
         self._monto_ext = MontoExtractor(ocr_reader)
-        self._fecha_ext = FechaEmisionExtractor(ocr_reader)
+        self._fecha_ext = FechaEmisionExtractor(ocr_reader, crop_ocr_reader=crop_ocr_reader)
         self._llm = llm_validator
 
     def extraer(
