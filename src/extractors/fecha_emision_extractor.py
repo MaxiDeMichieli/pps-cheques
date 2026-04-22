@@ -1,8 +1,16 @@
 """Extractor de zona de fecha de emision de cheques.
 
-Lee los tokens OCR de la franja donde aparece la linea de ciudad + fecha,
-usando el token "EL" como ancla inferior (siempre esta en la linea siguiente
-al "CIUDAD, DD DE MES DE AAAA" de emision).
+Estrategia hibrida:
+  1. OCR amplio sobre la mitad superior del cheque.
+  2. Detectar el cy de la linea de emision usando el cluster superior de
+     pares 'DE' (excluyendo boilerplate y linea de pago).
+     Como refuerzo, si no se encuentra un par DE, se intenta localizar el
+     token 'EL' (incluso fusionado: ELJ8, EL19DE...) y estimar la linea
+     de emision como la linea inmediatamente anterior.
+  3. Con el cy estimado, recortar el cheque original en esa banda vertical
+     y re-ejecutar OCR sobre el crop — exactamente como hacia el enfoque
+     original, pero con deteccion de linea mas robusta.
+  Fallback: filtrar del scan amplio por tokens de mes/año conocido.
 """
 
 import logging
@@ -23,33 +31,39 @@ _MESES_NOMBRES = {
 
 
 def _es_token_fecha(text: str) -> bool:
-    """Indica si un token pertenece tipicamente a la linea de ciudad+fecha."""
     t = text.strip().lower()
     if t in _MESES_NOMBRES:
         return True
-    # Año: 4 digitos entre 2000-2099
     if re.match(r'^20\d{2}$', t):
         return True
     return False
 
 
-_DEBUG_FECHA_ZONA = "fecha_zona.png"
+# Acepta 'DE', 'de', 'DE.', '_DE_', etc.
+_DE_RE = re.compile(r'^[^a-zA-Z0-9]*[Dd][Ee][^a-zA-Z0-9]*$')
 
-# Acepta 'EL', 'El', 'el', 'L', 'l' — errores comunes de OCR para el token "EL"
-_EL_RE = re.compile(r'^[Ee]?[Ll]$')
+# Detecta 'EL' incluso fusionado con el dia siguiente (ELJ8, EL19DE, ELZo, EL.)
+_EL_INICIO_RE = re.compile(r'^[Ee][Ll]')
+
+# Tokens que identifican el boilerplate "La fecha de pago no puede exceder un plazo de 360 dias"
+_BOILERPLATE_RE = re.compile(r'^(360|dias?)$', re.IGNORECASE)
+
+_DEBUG_FECHA_ZONA = "fecha_zona.png"
+_VENTANA_CY = 0.07
 
 
 class FechaEmisionExtractor:
     """Lee los tokens OCR de la zona de fecha de emision."""
 
-    def __init__(self, ocr_reader: OCRReader):
+    def __init__(self, ocr_reader: OCRReader, crop_ocr_reader: OCRReader | None = None):
         self._ocr = ocr_reader
+        self._crop_ocr = crop_ocr_reader or ocr_reader
 
     def leer_tokens(self, cheque_img: np.ndarray, debug_dir: Path | None = None) -> list[OCRResult]:
         """Devuelve tokens OCR de la linea de fecha de emision.
 
-        Paso 1: OCR sobre una franja amplia para localizar "EL" y estimar la altura de linea.
-        Paso 2: Recortar exactamente la linea anterior al "EL" y re-ejecutar OCR.
+        Paso 1: OCR sobre una franja amplia para detectar posicion de la linea.
+        Paso 2: Crop + re-OCR sobre la banda de la linea de emision.
         Fallback: filtrar del scan amplio por tokens de mes/año conocido.
         """
         h, w = cheque_img.shape[:2]
@@ -57,44 +71,111 @@ class FechaEmisionExtractor:
         scan_x0 = int(w * 0.10)
         zona = cheque_img[0:scan_h, scan_x0:w]
         tokens_scan = self._ocr.read(zona)
-
-        el_token = next(
-            (t for t in tokens_scan if _EL_RE.match(t.text.strip()) and t.cy > 0.35),
-            None,
-        )
-        logger.info(
-            "EL token: %s",
-            f"text={el_token.text!r} cy={el_token.cy:.3f} h={el_token.height:.3f}" if el_token else "no encontrado",
-        )
         logger.info("Tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
 
-        if el_token:
-            tokens = self._crop_fecha(cheque_img, tokens_scan, el_token, w, scan_h, scan_x0, debug_dir)
+        cy_emision = self._detectar_cy_emision(tokens_scan)
+        if cy_emision is not None:
+            tokens = self._crop_por_cy(cheque_img, tokens_scan, cy_emision, w, scan_h, scan_x0, debug_dir)
             if tokens:
                 return tokens
 
         return self._fallback_fecha(tokens_scan, zona, debug_dir)
 
-    def _crop_fecha(
+    def _detectar_cy_emision(self, tokens_scan: list[OCRResult]) -> float | None:
+        """Detecta el cy (normalizado al scan) de la linea de emision."""
+        el_token = self._encontrar_el(tokens_scan)
+        el_cy = el_token.cy if el_token else None
+
+        cy = self._cy_por_de_cluster(tokens_scan, el_cy)
+        if cy is not None:
+            return cy
+
+        return self._cy_por_el_ancla(el_token)
+
+    @staticmethod
+    def _encontrar_el(tokens_scan: list[OCRResult]) -> OCRResult | None:
+        token = next(
+            (t for t in tokens_scan if _EL_INICIO_RE.match(t.text.strip()) and t.cy > 0.35),
+            None,
+        )
+        logger.info(
+            "EL-linea: %s",
+            f"cy={token.cy:.3f} (token={token.text!r})" if token else "no detectada",
+        )
+        return token
+
+    @staticmethod
+    def _agrupar_de_clusters(de_tokens: list[OCRResult]) -> list[list[OCRResult]]:
+        clusters: list[list[OCRResult]] = [[de_tokens[0]]]
+        for tok in de_tokens[1:]:
+            if tok.cy - clusters[-1][-1].cy < 0.06:
+                clusters[-1].append(tok)
+            else:
+                clusters.append([tok])
+        return clusters
+
+    def _cy_por_de_cluster(self, tokens_scan: list[OCRResult], el_cy: float | None) -> float | None:
+        de_tokens = sorted(
+            [t for t in tokens_scan if _DE_RE.match(t.text.strip())],
+            key=lambda t: t.cy,
+        )
+        if len(de_tokens) < 2:
+            logger.info("DE-cluster: menos de 2 tokens 'DE' encontrados")
+            return None
+
+        validos = [c for c in self._agrupar_de_clusters(de_tokens) if len(c) >= 2]
+        for cluster in sorted(validos, key=lambda c: c[0].cy):
+            cy_centro = sum(t.cy for t in cluster) / len(cluster)
+            vecinos = [t for t in tokens_scan if abs(t.cy - cy_centro) < _VENTANA_CY]
+            if any(_BOILERPLATE_RE.match(t.text.strip()) for t in vecinos):
+                logger.info("DE-cluster: cy=%.3f descartado (boilerplate)", cy_centro)
+                continue
+            if el_cy is not None and cy_centro >= el_cy - 0.02:
+                logger.info("DE-cluster: cy=%.3f descartado (linea de pago)", cy_centro)
+                continue
+            logger.info(
+                "DE-cluster: usando cy=%.3f %s",
+                cy_centro, [(t.text, round(t.cy, 3)) for t in cluster],
+            )
+            return cy_centro
+
+        logger.info("DE-cluster: todos los clusters descartados")
+        return None
+
+    @staticmethod
+    def _cy_por_el_ancla(el_token: OCRResult | None) -> float | None:
+        if el_token is None:
+            return None
+        token_h = max(el_token.height, 0.07)
+        cy_estimado = el_token.cy - token_h * 1.5
+        logger.info("EL-ancla: estimando cy_emision=%.3f (el_cy=%.3f - 1.5*h)", cy_estimado, el_token.cy)
+        return cy_estimado
+
+    def _crop_por_cy(
         self,
         cheque_img: np.ndarray,
         tokens_scan: list[OCRResult],
-        el_token: OCRResult,
+        cy_emision: float,
         w: int,
         scan_h: int,
         scan_x0: int,
         debug_dir: Path | None,
     ) -> list[OCRResult]:
-        """Recorta la linea de fecha usando el token EL como ancla."""
-        el_abs_y = int(el_token.cy * scan_h)
-        # Floor de 0.07 por si el OCR devuelve un caracter parcial ('L' en vez de 'EL')
-        # con bounding box incorrectamente pequeño. Espaciado real ~1.5x altura de token.
-        token_h_norm = max(el_token.height, 0.07)
+        """Recorta la banda de la linea de emision y re-ejecuta OCR."""
+        # Estimar altura de linea a partir del token EL o de un token DE cercano
+        ancla = next(
+            (t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY and t.height > 0),
+            None,
+        )
+        token_h_norm = max(ancla.height if ancla else 0.0, 0.07)
         token_h_px = int(token_h_norm * scan_h)
-        centro_fecha = el_abs_y - int(token_h_px * 1.5)
-        y0 = max(0, centro_fecha - token_h_px)
-        y1 = min(scan_h, centro_fecha + token_h_px)
-        scan_x1 = self._detectar_limite_derecho(tokens_scan, centro_fecha, scan_h, scan_x0, w, token_h_norm)
+        centro_px = int(cy_emision * scan_h)
+
+        margen_px = int(token_h_px * 1.5)
+        offset_px = int(token_h_px * 0.5)
+        y0 = max(0, centro_px - margen_px - offset_px)
+        y1 = min(scan_h, centro_px + margen_px - offset_px)
+        scan_x1 = self._detectar_limite_derecho(tokens_scan, cy_emision, scan_h, scan_x0, w, token_h_norm)
 
         fecha_crop = cheque_img[y0:y1, scan_x0:scan_x1]
         logger.info(
@@ -107,22 +188,21 @@ class FechaEmisionExtractor:
 
         if debug_dir is not None:
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
-        tokens = self._ocr.read(fecha_crop)
+        tokens = self._crop_ocr.read(fecha_crop)
         logger.info("Fecha crop -> %d tokens", len(tokens))
         return tokens
 
     @staticmethod
     def _detectar_limite_derecho(
         tokens_scan: list[OCRResult],
-        centro_fecha: int,
+        cy_emision: float,
         scan_h: int,
         scan_x0: int,
         w: int,
         token_h_norm: float,
     ) -> int:
-        """Devuelve el x absoluto donde comienza el identificador del cheque en la fila de fecha."""
-        cy_fecha_norm = centro_fecha / scan_h
-        fila = [t for t in tokens_scan if abs(t.cy - cy_fecha_norm) < token_h_norm]
+        """Devuelve el x absoluto donde comienza el identificador del cheque en la fila de emision."""
+        fila = [t for t in tokens_scan if abs(t.cy - cy_emision) < token_h_norm]
         id_tokens = [t for t in fila if re.match(r'^\d{6,}$', t.text.strip()) and t.cx > 0.4]
         if id_tokens:
             leftmost = min(id_tokens, key=lambda t: t.cx)

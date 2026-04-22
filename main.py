@@ -14,7 +14,7 @@ logging.basicConfig(
 from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen, cargar_imagen
 from src.detection.check_detector import detectar_cheques
 from src.extractors.cheque_extractor import ChequeExtractor
-from src.ocr.ocr_readers import DocTRReader
+from src.ocr.ocr_readers import DocTRReader, TrOCRReader, SuryaReader
 from src.llm.llm_backends import OllamaBackend
 from src.llm.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
@@ -97,8 +97,17 @@ def procesar_pdf(
 
 def cmd_procesar(args):
     """Comando: procesar PDF(s)."""
-    print("Inicializando OCR (docTR)...")
-    ocr_reader = DocTRReader()
+    if getattr(args, 'surya', False):
+        print("Inicializando OCR (Surya)...")
+        ocr_reader = SuryaReader()
+        crop_ocr = None
+    else:
+        print("Inicializando OCR (docTR)...")
+        ocr_reader = DocTRReader()
+        crop_ocr = None
+        if getattr(args, 'trocr', False):
+            print("Inicializando TrOCR para crops de fecha...")
+            crop_ocr = TrOCRReader()
 
     llm = None
     if not args.sin_llm:
@@ -106,7 +115,7 @@ def cmd_procesar(args):
         backend = OllamaBackend(model=args.llm_model, base_url=args.llm_url)
         llm = LLMValidator(backend=backend)
 
-    extractor = ChequeExtractor(ocr_reader, llm_validator=llm)
+    extractor = ChequeExtractor(ocr_reader, llm_validator=llm, crop_ocr_reader=crop_ocr)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
@@ -217,6 +226,10 @@ def main():
                         help="URL del servidor Ollama (default: http://localhost:11434)")
     p_proc.add_argument("--debug", action="store_true",
                         help="Activar logging DEBUG y guardar imagenes intermedias en output/debug/")
+    p_proc.add_argument("--trocr", action="store_true",
+                        help="Usar TrOCR (handwritten) para el re-OCR del crop de fecha de emision")
+    p_proc.add_argument("--surya", action="store_true",
+                        help="Usar Surya como motor OCR completo en lugar de docTR")
     p_proc.set_defaults(func=cmd_procesar)
 
     p_list = subparsers.add_parser("listar", help="Listar cheques procesados")
