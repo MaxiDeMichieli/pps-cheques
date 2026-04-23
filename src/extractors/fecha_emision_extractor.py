@@ -15,12 +15,17 @@ Estrategia hibrida:
 
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
+
+if TYPE_CHECKING:
+    from ..llm.llm_backends import OllamaBackend
 
 logger = logging.getLogger(__name__)
 
@@ -50,21 +55,66 @@ _BOILERPLATE_RE = re.compile(r'^(360|dias?)$', re.IGNORECASE)
 
 _DEBUG_FECHA_ZONA = "fecha_zona.png"
 _VENTANA_CY = 0.07
+_ISO_DATE_RE = re.compile(r'\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])')
+# llava works best with images at least this tall; short crops get upscaled.
+_VISION_MIN_HEIGHT_PX = 200
+
+_VISION_FECHA_PROMPT = """\
+You are reading the emission date line of an Argentine bank cheque (CPD).
+The date is handwritten in ink in the format: DD DE MES DE YYYY
+The line usually starts with a city name (e.g. QUILMES, DON TORCUATO).
+
+YOUR JOB: infer the most likely date. Be flexible in reading, strict in output.
+
+READING RULES (be flexible):
+- The month is always one of exactly 12 Spanish names. Even if the handwriting is
+  partial or joined, match the visible letters to the only month they could be.
+  Examples: "Nor" → Noviembre (no other month starts with N-o-r)
+            "Feb" → Febrero, "Ener" → Enero, "Di" → Diciembre
+- Digits 0/O and 1/l are often confused in handwriting — use context (valid day 01-31,
+  valid year 2024-2026) to pick the right one.
+- Commit to your best reading. Do not refuse because of imperfect handwriting.
+
+OUTPUT RULES (be strict):
+- Reply with ONLY the date in ISO format: YYYY-MM-DD (e.g. 2026-11-16)
+- No other text, no explanation, no punctuation around the date.
+- Reply null ONLY if the image is so damaged you cannot see a single digit or letter
+  of the date — not because the handwriting is imperfect.\
+"""
+
+
+def make_vision_fecha_fn(backend: "OllamaBackend") -> Callable[[np.ndarray], str | None]:
+    """Retorna una vision_fn lista para inyectar en FechaEmisionExtractor."""
+    def _fn(img: np.ndarray) -> str | None:
+        messages = [{"role": "user", "content": _VISION_FECHA_PROMPT}]
+        return backend.chat_vision(messages, [img])
+    return _fn
 
 
 class FechaEmisionExtractor:
     """Lee los tokens OCR de la zona de fecha de emision."""
 
-    def __init__(self, ocr_reader: OCRReader, crop_ocr_reader: OCRReader | None = None):
+    def __init__(
+        self,
+        ocr_reader: OCRReader,
+        crop_ocr_reader: OCRReader | None = None,
+        vision_fn: Callable[[np.ndarray], str | None] | None = None,
+    ):
         self._ocr = ocr_reader
         self._crop_ocr = crop_ocr_reader or ocr_reader
+        self._vision_fn = vision_fn
 
-    def leer_tokens(self, cheque_img: np.ndarray, debug_dir: Path | None = None) -> list[OCRResult]:
-        """Devuelve tokens OCR de la linea de fecha de emision.
+    def leer_tokens(
+        self,
+        cheque_img: np.ndarray,
+        debug_dir: Path | None = None,
+    ) -> tuple[list[OCRResult], list[OCRResult]]:
+        """Devuelve (crop_tokens, scan_window_tokens).
 
-        Paso 1: OCR sobre una franja amplia para detectar posicion de la linea.
-        Paso 2: Crop + re-OCR sobre la banda de la linea de emision.
-        Fallback: filtrar del scan amplio por tokens de mes/año conocido.
+        crop_tokens: tokens del crop re-OCR (o fallback del scan amplio).
+        scan_window_tokens: tokens del scan amplio dentro de ±_VENTANA_CY
+            alrededor del cy de la linea de emision. Mas limpios que el crop
+            re-OCR para inferencia LLM. Vacio si no se detecto cy_emision.
         """
         h, w = cheque_img.shape[:2]
         scan_h = int(h * 0.55)
@@ -74,12 +124,20 @@ class FechaEmisionExtractor:
         logger.info("Tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
 
         cy_emision = self._detectar_cy_emision(tokens_scan)
+
+        scan_window: list[OCRResult] = []
         if cy_emision is not None:
+            scan_window = [t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY]
+            logger.info(
+                "Scan window (cy=%.3f ±%.3f): %s",
+                cy_emision, _VENTANA_CY,
+                [(t.text, round(t.cy, 3)) for t in scan_window],
+            )
             tokens = self._crop_por_cy(cheque_img, tokens_scan, cy_emision, w, scan_h, scan_x0, debug_dir)
             if tokens:
-                return tokens
+                return tokens, scan_window
 
-        return self._fallback_fecha(tokens_scan, zona, debug_dir)
+        return self._fallback_fecha(tokens_scan, zona, debug_dir), scan_window
 
     def _detectar_cy_emision(self, tokens_scan: list[OCRResult]) -> float | None:
         """Detecta el cy (normalizado al scan) de la linea de emision."""
@@ -188,6 +246,19 @@ class FechaEmisionExtractor:
 
         if debug_dir is not None:
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
+
+        if self._vision_fn is not None:
+            vision_input = self._upscale_for_vision(fecha_crop)
+            raw = self._vision_fn(vision_input)
+            logger.info("Vision LLM fecha raw: %r", raw)
+            if raw:
+                match = _ISO_DATE_RE.search(raw)
+                if match:
+                    candidate = match.group(0)
+                    logger.info("Vision LLM fecha aceptada: %s", candidate)
+                    return [OCRResult(candidate, 1.0, 0.5, 0.5, 0.1)]
+            logger.info("Vision LLM no retornó fecha ISO válida, usando OCR")
+
         tokens = self._crop_ocr.read(fecha_crop)
         logger.info("Fecha crop -> %d tokens", len(tokens))
         return tokens
@@ -210,6 +281,24 @@ class FechaEmisionExtractor:
             logger.info("Limite derecho: token %r en cx=%.2f -> x=%d", leftmost.text, leftmost.cx, x1)
             return x1
         return w
+
+    @staticmethod
+    def _upscale_for_vision(img: np.ndarray) -> np.ndarray:
+        """Escala el crop para que tenga al menos _VISION_MIN_HEIGHT_PX de alto.
+
+        Las tiras de fecha son muy anchas y bajas (~100×1500px). llava las
+        comprime a 336×336 y pierde detalle. Escalar la altura ayuda.
+        """
+        h, w = img.shape[:2]
+        if h >= _VISION_MIN_HEIGHT_PX:
+            return img
+        scale = _VISION_MIN_HEIGHT_PX / h
+        new_w = int(w * scale)
+        new_h = _VISION_MIN_HEIGHT_PX
+        pil = Image.fromarray(img)
+        pil = pil.resize((new_w, new_h), Image.LANCZOS)
+        logger.info("Vision crop upscaled %dx%d -> %dx%d", w, h, new_w, new_h)
+        return np.array(pil)
 
     def _fallback_fecha(
         self,

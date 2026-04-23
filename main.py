@@ -14,6 +14,7 @@ logging.basicConfig(
 from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen, cargar_imagen
 from src.detection.check_detector import detectar_cheques
 from src.extractors.cheque_extractor import ChequeExtractor
+from src.extractors.fecha_emision_extractor import make_vision_fecha_fn
 from src.ocr.ocr_readers import DocTRReader, TrOCRReader, SuryaReader
 from src.llm.llm_backends import OllamaBackend
 from src.llm.llm_validator import LLMValidator
@@ -115,7 +116,13 @@ def cmd_procesar(args):
         backend = OllamaBackend(model=args.llm_model, base_url=args.llm_url)
         llm = LLMValidator(backend=backend)
 
-    extractor = ChequeExtractor(ocr_reader, llm_validator=llm, crop_ocr_reader=crop_ocr)
+    vision_fn = None
+    if getattr(args, 'vision_llm', False):
+        print(f"Inicializando Vision LLM ({args.vision_model} @ {args.llm_url})...")
+        vision_backend = OllamaBackend(model=args.vision_model, base_url=args.llm_url)
+        vision_fn = make_vision_fecha_fn(vision_backend)
+
+    extractor = ChequeExtractor(ocr_reader, llm_validator=llm, crop_ocr_reader=crop_ocr, vision_fn=vision_fn)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
@@ -135,6 +142,8 @@ def cmd_procesar(args):
     debug_dir: Path | None = None
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        for noisy in ("httpcore", "httpx", "PIL"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
         debug_dir = Path(args.output) / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         log_file = debug_dir / "debug.log"
@@ -230,6 +239,10 @@ def main():
                         help="Usar TrOCR (handwritten) para el re-OCR del crop de fecha de emision")
     p_proc.add_argument("--surya", action="store_true",
                         help="Usar Surya como motor OCR completo en lugar de docTR")
+    p_proc.add_argument("--vision-llm", action="store_true",
+                        help="Usar vision LLM para leer el crop de fecha (requiere ollama pull llava:7b)")
+    p_proc.add_argument("--vision-model", default="llava:7b",
+                        help="Modelo Ollama vision a usar (default: llava:7b)")
     p_proc.set_defaults(func=cmd_procesar)
 
     p_list = subparsers.add_parser("listar", help="Listar cheques procesados")
