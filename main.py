@@ -111,7 +111,7 @@ def cmd_procesar(args):
             crop_ocr = TrOCRReader()
 
     llm = None
-    if not args.sin_llm:
+    if getattr(args, 'con_llm', False):
         print(f"Inicializando LLM ({args.llm_model} @ {args.llm_url})...")
         backend = OllamaBackend(model=args.llm_model, base_url=args.llm_url)
         llm = LLMValidator(backend=backend)
@@ -227,8 +227,8 @@ def main():
 
     p_proc = subparsers.add_parser("procesar", help="Procesar PDF(s) con cheques")
     p_proc.add_argument("entrada", help="Archivo PDF o directorio con PDFs")
-    p_proc.add_argument("--sin-llm", action="store_true",
-                        help="Desactivar validacion LLM (solo OCR heuristico)")
+    p_proc.add_argument("--con-llm", action="store_true",
+                        help="Activar validacion con LLM de texto (requiere ollama)")
     p_proc.add_argument("--llm-model", default="llama3.2",
                         help="Modelo Ollama a usar (default: llama3.2)")
     p_proc.add_argument("--llm-url", default="http://localhost:11434",

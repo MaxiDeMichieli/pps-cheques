@@ -56,37 +56,71 @@ _BOILERPLATE_RE = re.compile(r'^(360|dias?)$', re.IGNORECASE)
 _DEBUG_FECHA_ZONA = "fecha_zona.png"
 _VENTANA_CY = 0.07
 _ISO_DATE_RE = re.compile(r'\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])')
+# Matches a token that is a city name ending with a comma, e.g. 'FEDERAL,' 'CUATIA,'
+_CIUDAD_COMA_RE = re.compile(r'^[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F]+,$')
+
+
 # llava works best with images at least this tall; short crops get upscaled.
 _VISION_MIN_HEIGHT_PX = 200
 
-_VISION_FECHA_PROMPT = """\
+
+def _build_vision_fecha_prompt(ocr_tokens: list[str], debug: bool) -> str:
+    """Builds the vision prompt with OCR tokens + image as dual sources."""
+    token_str = " ".join(ocr_tokens) if ocr_tokens else "(none)"
+    debug_block = (
+        "SINCE THIS IS DEBUG MODE: before the ISO date, add exactly one line starting with "
+        "'REASONING:' explaining, for each field (day / month / year), which source you used "
+        "and why.\n\n"
+    ) if debug else ""
+    return """\
 You are reading the emission date line of an Argentine bank cheque (CPD).
-The date is handwritten in ink in the format: DD DE MES DE YYYY
+The date is handwritten in the format: DD DE MES DE YYYY
 The line usually starts with a city name (e.g. QUILMES, DON TORCUATO).
 
-YOUR JOB: infer the most likely date. Be flexible in reading, strict in output.
+You have TWO sources of information:
+  1. OCR TOKENS from the date area (left to right, may contain noise): {token_str}
+  2. The attached IMAGE of the same date area.
 
-READING RULES (be flexible):
-- The month is always one of exactly 12 Spanish names. Even if the handwriting is
-  partial or joined, match the visible letters to the only month they could be.
-  Examples: "Nor" → Noviembre (no other month starts with N-o-r)
-            "Feb" → Febrero, "Ener" → Enero, "Di" → Diciembre
-- Digits 0/O and 1/l are often confused in handwriting — use context (valid day 01-31,
-  valid year 2024-2026) to pick the right one.
-- Commit to your best reading. Do not refuse because of imperfect handwriting.
+TASK — determine the best reading for each field independently:
+  - DAY  (01-31): which source gives you the clearest number?
+  - MONTH (Spanish name): which source gives you the clearest text?
+  - YEAR (2024-2027): which source gives you the clearest number?
 
-OUTPUT RULES (be strict):
-- Reply with ONLY the date in ISO format: YYYY-MM-DD (e.g. 2026-11-16)
-- No other text, no explanation, no punctuation around the date.
-- Reply null ONLY if the image is so damaged you cannot see a single digit or letter
-  of the date — not because the handwriting is imperfect.\
-"""
+For each field, prefer the source where the evidence is unambiguous.
+If the OCR tokens contain a clear month name (e.g. "enero", "Nov", "Fe") that is
+recognisable, trust that over the image. If they contain a clear 4-digit year or a
+clear 1-2 digit day, trust those too. Only fall back to the image for fields where
+the tokens are garbled, missing, or contradictory.
+
+READING RULES (apply to both sources):
+- The month is always one of exactly 12 Spanish names. Match partial or garbled text to
+  the ONLY month it could belong to:
+    Fe / Feb              → Febrero   (02) — only month starting Fe
+    En / Ene              → Enero     (01) — only month starting En
+    Ma (short)            → Marzo     (03); Ma + y / longer → Mayo (05)
+    Ab / Abr              → Abril     (04) — only month starting Ab
+    Ju + n                → Junio     (06); Ju + l → Julio (07)
+    Ag / Ago              → Agosto    (08) — only month starting Ag
+    Se / Sep              → Septiembre(09) — only month starting Se
+    Oc / Oct              → Octubre   (10) — only month starting Oc
+    No / Nov              → Noviembre (11) — only month starting No
+    Di / Dic              → Diciembre (12) — only month starting Di
+- Digits 0/O and 1/l are often confused — use context (valid day 01-31,
+  valid year 2024-2027) to resolve them. Example: Z026 → 2026, l6 → 16.
+- Commit to your best reading. Do not refuse because of imperfect handwriting or noise.
+
+{debug_block}OUTPUT RULES (be strict):
+- Reply with the date in ISO format: YYYY-MM-DD (e.g. 2026-01-15)
+- No extra text or punctuation around the ISO date.
+- Reply null ONLY if neither source lets you determine any part of the date.\
+""".format(token_str=token_str, debug_block=debug_block)
 
 
-def make_vision_fecha_fn(backend: "OllamaBackend") -> Callable[[np.ndarray], str | None]:
+def make_vision_fecha_fn(backend: "OllamaBackend") -> "Callable[[np.ndarray, list[str], bool], str | None]":
     """Retorna una vision_fn lista para inyectar en FechaEmisionExtractor."""
-    def _fn(img: np.ndarray) -> str | None:
-        messages = [{"role": "user", "content": _VISION_FECHA_PROMPT}]
+    def _fn(img: np.ndarray, ocr_tokens: list[str], debug: bool = False) -> str | None:
+        prompt = _build_vision_fecha_prompt(ocr_tokens, debug)
+        messages = [{"role": "user", "content": prompt}]
         return backend.chat_vision(messages, [img])
     return _fn
 
@@ -98,7 +132,7 @@ class FechaEmisionExtractor:
         self,
         ocr_reader: OCRReader,
         crop_ocr_reader: OCRReader | None = None,
-        vision_fn: Callable[[np.ndarray], str | None] | None = None,
+        vision_fn: "Callable[[np.ndarray, list[str], bool], str | None] | None" = None,
     ):
         self._ocr = ocr_reader
         self._crop_ocr = crop_ocr_reader or ocr_reader
@@ -122,7 +156,27 @@ class FechaEmisionExtractor:
         zona = cheque_img[0:scan_h, scan_x0:w]
         tokens_scan = self._ocr.read(zona)
         logger.info("Tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
+        # 1. Ciudad-coma anchor: token like 'FEDERAL,' or 'CUATIA,' marks the
+        #    start of the emission date line. Crop starts just after that token.
+        ciudad_coma = self._encontrar_ciudad_coma(tokens_scan)
+        if ciudad_coma is not None:
+            cy_emision = ciudad_coma.cy
+            x_left = scan_x0 + int(ciudad_coma.cx * (w - scan_x0))
+            logger.info(
+                "Ciudad-coma ancla: token=%r cy=%.3f cx=%.3f -> x_left=%d",
+                ciudad_coma.text, cy_emision, ciudad_coma.cx, x_left,
+            )
+            scan_window = [t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY]
+            logger.info(
+                "Scan window (cy=%.3f \u00b1%.3f): %s",
+                cy_emision, _VENTANA_CY,
+                [(t.text, round(t.cy, 3)) for t in scan_window],
+            )
+            tokens = self._crop_por_cy(cheque_img, tokens_scan, cy_emision, w, scan_h, scan_x0, debug_dir, x_left=x_left)
+            if tokens:
+                return tokens, scan_window
 
+        # 2. Existing DE-cluster / EL-ancla flow
         cy_emision = self._detectar_cy_emision(tokens_scan)
 
         scan_window: list[OCRResult] = []
@@ -138,6 +192,19 @@ class FechaEmisionExtractor:
                 return tokens, scan_window
 
         return self._fallback_fecha(tokens_scan, zona, debug_dir), scan_window
+
+    @staticmethod
+    def _encontrar_ciudad_coma(tokens_scan: list[OCRResult]) -> OCRResult | None:
+        """Busca el token de ciudad con coma al final (e.g. 'FEDERAL,', 'CUATIA,')."""
+        token = next(
+            (t for t in tokens_scan if _CIUDAD_COMA_RE.match(t.text.strip()) and t.cy > 0.30),
+            None,
+        )
+        if token:
+            logger.info("Ciudad-coma: encontrado %r en cy=%.3f", token.text, token.cy)
+        else:
+            logger.info("Ciudad-coma: no encontrado")
+        return token
 
     def _detectar_cy_emision(self, tokens_scan: list[OCRResult]) -> float | None:
         """Detecta el cy (normalizado al scan) de la linea de emision."""
@@ -218,6 +285,7 @@ class FechaEmisionExtractor:
         scan_h: int,
         scan_x0: int,
         debug_dir: Path | None,
+        x_left: int | None = None,
     ) -> list[OCRResult]:
         """Recorta la banda de la linea de emision y re-ejecuta OCR."""
         # Estimar altura de linea a partir del token EL o de un token DE cercano
@@ -234,11 +302,12 @@ class FechaEmisionExtractor:
         y0 = max(0, centro_px - margen_px - offset_px)
         y1 = min(scan_h, centro_px + margen_px - offset_px)
         scan_x1 = self._detectar_limite_derecho(tokens_scan, cy_emision, scan_h, scan_x0, w, token_h_norm)
+        crop_x0 = x_left if x_left is not None else scan_x0
 
-        fecha_crop = cheque_img[y0:y1, scan_x0:scan_x1]
+        fecha_crop = cheque_img[y0:y1, crop_x0:scan_x1]
         logger.info(
             "Fecha crop [y=%d:%d, x=%d:%d, token_h=%dpx]",
-            y0, y1, scan_x0, scan_x1, token_h_px,
+            y0, y1, crop_x0, scan_x1, token_h_px,
         )
 
         if fecha_crop.size == 0 or y1 <= y0:
@@ -247,21 +316,41 @@ class FechaEmisionExtractor:
         if debug_dir is not None:
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
 
-        if self._vision_fn is not None:
-            vision_input = self._upscale_for_vision(fecha_crop)
-            raw = self._vision_fn(vision_input)
-            logger.info("Vision LLM fecha raw: %r", raw)
-            if raw:
-                match = _ISO_DATE_RE.search(raw)
-                if match:
-                    candidate = match.group(0)
-                    logger.info("Vision LLM fecha aceptada: %s", candidate)
-                    return [OCRResult(candidate, 1.0, 0.5, 0.5, 0.1)]
-            logger.info("Vision LLM no retornó fecha ISO válida, usando OCR")
-
         tokens = self._crop_ocr.read(fecha_crop)
-        logger.info("Fecha crop -> %d tokens", len(tokens))
+        ocr_texts = [t.text for t in tokens]
+        logger.info("Fecha crop -> %d tokens: %s", len(tokens), ocr_texts)
+
+        if self._vision_fn is not None:
+            result = self._llamar_vision_llm(fecha_crop, ocr_texts, debug_dir is not None)
+            if result is not None:
+                return result
+
         return tokens
+
+    def _llamar_vision_llm(
+        self,
+        fecha_crop: np.ndarray,
+        ocr_texts: list[str],
+        debug_mode: bool,
+    ) -> list[OCRResult] | None:
+        """Llama al Vision LLM y retorna un OCRResult con la fecha ISO, o None si falla."""
+        vision_input = self._upscale_for_vision(fecha_crop)
+        raw = self._vision_fn(vision_input, ocr_texts, debug_mode)  # type: ignore[misc]
+        logger.info("Vision LLM fecha raw: %r", raw)
+        if not raw:
+            logger.info("Vision LLM no retornó fecha ISO válida")
+            return None
+        if debug_mode:
+            reasoning_match = re.search(r'REASONING:\s*(.+)', raw, re.IGNORECASE)
+            if reasoning_match:
+                logger.info("Vision LLM reasoning: %s", reasoning_match.group(1).strip())
+        match = _ISO_DATE_RE.search(raw)
+        if match:
+            candidate = match.group(0)
+            logger.info("Vision LLM fecha aceptada: %s", candidate)
+            return [OCRResult(candidate, 1.0, 0.5, 0.5, 0.1)]
+        logger.info("Vision LLM no retornó fecha ISO válida")
+        return None
 
     @staticmethod
     def _detectar_limite_derecho(
