@@ -47,6 +47,9 @@ def _es_token_fecha(text: str) -> bool:
 # Acepta 'DE', 'de', 'DE.', '_DE_', etc.
 _DE_RE = re.compile(r'^[^a-zA-Z0-9]*[Dd][Ee][^a-zA-Z0-9]*$')
 
+# Acepta 'DE', 'de', 'DE.', '_DE_', etc. (solo Mayúsculas)
+_DE_MAYUS_RE = re.compile(r'^[^a-zA-Z0-9]*DE[^a-zA-Z0-9]*$')
+
 # Detecta 'EL' incluso fusionado con el dia siguiente (ELJ8, EL19DE, ELZo, EL.)
 _EL_INICIO_RE = re.compile(r'^[Ee][Ll]')
 
@@ -114,6 +117,106 @@ READING RULES (apply to both sources):
 - No extra text or punctuation around the ISO date.
 - Reply null ONLY if neither source lets you determine any part of the date.\
 """.format(token_str=token_str, debug_block=debug_block)
+
+def _es_fecha_valida(text: str) -> bool:
+    return bool(re.match(r'\d{2} DE [A-Za-z]+ DE \d{4}', text))
+
+def _limpiar_dia(text: str) -> str:
+    """Extrae solo los dígitos que forman un día válido (01-31) del texto sucio."""
+    # Busca secuencias de dígitos
+    digits = re.findall(r'\d+', text)
+    for d in digits:
+        num = int(d)
+        if 1 <= num <= 31:
+            return str(num).zfill(2)  # Retorna con 0 si es necesario
+    return text  # Fallback: devuelve el original
+
+
+def _limpiar_mes(text: str) -> str:
+    """Extrae el mes en español válido del texto sucio.
+    
+    Busca en la lista de meses válidos, incluso parcialmente en el texto.
+    """
+    text_lower = text.lower().strip()
+    # Busca match con cada mes (orden importa para evitar confusiones)
+    for mes in ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]:
+        if mes in text_lower:
+            return mes.capitalize()
+    return text  # Fallback: devuelve el original
+
+
+def _limpiar_ano(text: str) -> str:
+    """Extrae solo los dígitos que forman un año válido (2020-2030) del texto sucio."""
+    # Busca secuencias de 4 dígitos
+    years = re.findall(r'\d{4}', text)
+    for year in years:
+        num = int(year)
+        if 2020 <= num <= 2030:  # Rango realista para cheques
+            return year
+    return text  # Fallback: devuelve el original
+
+
+def _filtrar_tokens_fecha_estructura(tokens: list[OCRResult]) -> list[OCRResult]:
+    """Filtra tokens para mantener solo la estructura: DIA DE MES DE AÑO
+    
+    Encuentra los dos "DE" en MAYÚSCULAS y extrae:
+    - Token anterior al primer DE → DIA
+    - Tokens entre los dos DE → MES
+    - Token posterior al segundo DE → AÑO
+    
+    Devuelve los tres componentes combinados en un único token.
+    También descarta tokens que correspondan al boilerplate.
+    """
+    de_indices = [i for i, t in enumerate(tokens) if _DE_MAYUS_RE.match(t.text.strip())]
+    
+    if len(de_indices) < 2:
+        logger.info("Estructura fecha: menos de 2 'DE' encontrados, retornando tokens originales")
+        return tokens
+    
+    idx_de1 = de_indices[0]
+    idx_de2 = de_indices[1]
+    
+    # Extraer DIA (token anterior al primer DE, descartando boilerplate)
+    dia_token = None
+    if idx_de1 > 0 and not _BOILERPLATE_RE.match(tokens[idx_de1 - 1].text.strip()):
+        dia_token = tokens[idx_de1 - 1]
+    
+    # Extraer MES (tokens entre los dos DE, descartando boilerplate)
+    mes_tokens = []
+    for i in range(idx_de1 + 1, idx_de2):
+        if not _BOILERPLATE_RE.match(tokens[i].text.strip()):
+            mes_tokens.append(tokens[i])
+    
+    # Extraer AÑO (token posterior al segundo DE, descartando boilerplate)
+    anio_token = None
+    if idx_de2 + 1 < len(tokens) and not _BOILERPLATE_RE.match(tokens[idx_de2 + 1].text.strip()):
+        anio_token = tokens[idx_de2 + 1]
+    
+    # Limpiar cada componente
+    dia_raw = dia_token.text.strip() if dia_token else ""
+    mes_raw = " ".join(t.text.strip() for t in mes_tokens) if mes_tokens else ""
+    anio_raw = anio_token.text.strip() if anio_token else ""
+    
+    dia_text = _limpiar_dia(dia_raw)
+    mes_text = _limpiar_mes(mes_raw)
+    anio_text = _limpiar_ano(anio_raw)
+    
+    fecha_completa = f"{dia_text} DE {mes_text} DE {anio_text}"
+    logger.info(
+        "Estructura fecha: DIA=%r (limpio: %r), MES=%r (limpio: %r), AÑO=%r (limpio: %r) -> %r",
+        dia_raw, dia_text, mes_raw, mes_text, anio_raw, anio_text, fecha_completa,
+    )
+    
+    # Devolver un único token con la fecha completa
+    resultado_token = OCRResult(
+        text=fecha_completa,
+        confidence=1.0,
+        cx=0.5,
+        cy=0.5,
+        height=0.1,
+    )
+    return [resultado_token]
 
 
 def make_vision_fecha_fn(backend: "OllamaBackend") -> "Callable[[np.ndarray, list[str], bool], str | None]":
@@ -317,7 +420,12 @@ class FechaEmisionExtractor:
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
 
         tokens = self._crop_ocr.read(fecha_crop)
+
+        # Filtrar tokens para mantener solo la estructura DIA DE MES DE AÑO
+        tokens = _filtrar_tokens_fecha_estructura(tokens)
+        
         ocr_texts = [t.text for t in tokens]
+
         logger.info("Fecha crop -> %d tokens: %s", len(tokens), ocr_texts)
 
         if self._vision_fn is not None:
