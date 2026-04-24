@@ -94,15 +94,27 @@ El mes es SIEMPRE uno de estos 12, sin excepción:
   Mayo=05   Junio=06    Julio=07    Agosto=08
   Septiembre=09  Octubre=10  Noviembre=11  Diciembre=12
 
-Reglas de inferencia:
-- Identificá el mes por las letras visibles aunque estén incompletas o mal leídas.
-  Las letras que ves son exactamente las que el OCR capturó del manuscrito.
-  Ejemplos: "Nor" → Noviembre (ningún otro mes empieza con N-o-r)
-            "ene" → Enero, "feb" → Febrero, "Agos" → Agosto
-- Confusiones OCR frecuentes en dígitos: Z↔2, o↔0, l↔1, S↔5, G↔6
+Reglas de inferencia para el MES — identificá por el prefijo visible, \
+cada prefijo es único salvo los indicados:
+  Fe / Feb              → Febrero   (único con Fe)
+  En / Ene              → Enero     (único con En)
+  Ma (corto)            → Marzo; Ma + y o más letras → Mayo
+  Ab / Abr              → Abril     (único con Ab)
+  Ju + n                → Junio; Ju + l → Julio
+  Ag / Ago              → Agosto    (único con Ag)
+  Se / Sep              → Septiembre (único con Se)
+  Oc / Oct              → Octubre   (único con Oc)
+  No / Nov / Nor        → Noviembre (único con No)
+  Di / Dic              → Diciembre (único con Di)
+
+Reglas para DÍGITOS (confusiones OCR frecuentes):
+  Z↔2, o/O↔0, l↔1, S↔5, G↔6, B↔8
   Ejemplos: "Z025" → 2025, "ZoZ6" → 2026, "l6" → 16
+- Si un token parece ruido sin letras ni dígitos reconocibles (ej. "DEZOZS"), ignoralo.
+
 - La fecha de emisión NO puede ser futura. Fecha máxima permitida: {today_max}
 - Si el año inferido es mayor a {max_year}, es un error OCR (probablemente Z→2).
+- Comprometete con tu mejor lectura. No te niegues por escritura imperfecta o ruido.
 
 Respondé ÚNICAMENTE con la fecha en formato ISO YYYY-MM-DD.
 Sin texto adicional. Si es imposible inferir cualquier componente de la fecha, \

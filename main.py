@@ -14,7 +14,7 @@ logging.basicConfig(
 from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen, cargar_imagen
 from src.detection.check_detector import detectar_cheques
 from src.extractors.cheque_extractor import ChequeExtractor
-from src.extractors.fecha_emision_extractor import make_vision_fecha_fn
+# from src.extractors.fecha_emision_extractor import make_vision_fecha_fn
 from src.ocr.ocr_readers import DocTRReader, TrOCRReader, SuryaReader
 from src.llm.llm_backends import OllamaBackend
 from src.llm.llm_validator import LLMValidator
@@ -36,7 +36,7 @@ def _extraer_de_imagen(
         cheque_debug_dir = debug_dir / f"{Path(pdf_name).stem}_p{num_pag}_ch{idx}"
         cheque_debug_dir.mkdir(exist_ok=True)
     print(f"    Cheque {idx}...", end=" ", flush=True)
-    datos = extractor.extraer(cheque_img, batch_context=batch_montos_raw, debug_dir=cheque_debug_dir)
+    datos = extractor.extraer(cheque_img, debug_dir=cheque_debug_dir)
     datos.imagen_path = ruta_img
     datos.pdf_origen = pdf_name
     datos.pagina = num_pag
@@ -116,13 +116,13 @@ def cmd_procesar(args):
         backend = OllamaBackend(model=args.llm_model, base_url=args.llm_url)
         llm = LLMValidator(backend=backend)
 
-    vision_fn = None
-    if getattr(args, 'vision_llm', False):
-        print(f"Inicializando Vision LLM ({args.vision_model} @ {args.llm_url})...")
-        vision_backend = OllamaBackend(model=args.vision_model, base_url=args.llm_url)
-        vision_fn = make_vision_fecha_fn(vision_backend)
+    # vision_fn = None
+    # if getattr(args, 'vision_llm', False):
+    #     print(f"Inicializando Vision LLM ({args.vision_model} @ {args.llm_url})...")
+    #     vision_backend = OllamaBackend(model=args.vision_model, base_url=args.llm_url)
+    #     vision_fn = make_vision_fecha_fn(vision_backend)
 
-    extractor = ChequeExtractor(ocr_reader, llm_validator=llm, crop_ocr_reader=crop_ocr, vision_fn=vision_fn)
+    extractor = ChequeExtractor(ocr_reader, llm_validator=llm)
     print("Listo.\n")
 
     ruta = Path(args.entrada)
