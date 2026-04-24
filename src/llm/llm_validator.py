@@ -13,10 +13,12 @@ import json
 import re
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from .llm_backends import LLMBackend
 from ..ocr.ocr_readers import OCRResult
+from ..extractors.fecha_extractor import Fecha
 
 
 logger = logging.getLogger(__name__)
@@ -94,16 +96,36 @@ El mes es SIEMPRE uno de estos 12, sin excepción:
   Mayo=05   Junio=06    Julio=07    Agosto=08
   Septiembre=09  Octubre=10  Noviembre=11  Diciembre=12
 
-Reglas de inferencia:
-- Identificá el mes por las letras visibles aunque estén incompletas o mal leídas.
-  Las letras que ves son exactamente las que el OCR capturó del manuscrito.
-  Ejemplos: "Nor" → Noviembre (ningún otro mes empieza con N-o-r)
-            "ene" → Enero, "feb" → Febrero, "Agos" → Agosto
-- Confusiones OCR frecuentes en dígitos: Z↔2, o↔0, l↔1, S↔5, G↔6
-  Ejemplos: "Z025" → 2025, "ZoZ6" → 2026, "l6" → 16
-- La fecha de emisión NO puede ser futura. Fecha máxima permitida: {today_max}
-- Si el año inferido es mayor a {max_year}, es un error OCR (probablemente Z→2).
+Reglas de inferencia para el MES — identificá por el prefijo visible, \
+cada prefijo es único salvo los indicados:
+  Fe / Feb              → Febrero   (único con Fe)
+  En / Ene              → Enero     (único con En)
+  Ma (corto)            → Marzo; Ma + y o más letras → Mayo
+  Ab / Abr              → Abril     (único con Ab)
+  Ju + n                → Junio; Ju + l → Julio
+  Ag / Ago              → Agosto    (único con Ag)
+  Se / Sep              → Septiembre (único con Se)
+  Oc / Oct              → Octubre   (único con Oc)
+  No / Nov / Nor / Norr → Noviembre (ÚNICO mes que empieza con "No"; si ves cualquier "No..." el mes ES Noviembre, no existe otro)
+  Di / Dic              → Diciembre (único con Di)
 
+Reglas para DÍGITOS (confusiones OCR frecuentes):
+  Z↔2, o/O↔0, l↔1, S↔5, G↔6, B↔8
+  Ejemplos: "Z025" → 2025, "ZoZ6" → 2026, "l6" → 16
+
+Reglas específicas para el DÍA — confusión "I" (letra) ↔ "1" (dígito):
+  "I"         → 1   (ej: "I" solo → día 1)
+  "II"        → 11
+  "I1" o "1I" → 11
+  "I" + dígito N → 1N  (ej: "I2"→12, "I3"→13, "I4"→14, ... "I9"→19)
+  dígito N + "I" → N1  (ej: "3I"→31, "2I"→21, "1I"→11)
+  Regla general: en el campo día, toda "I" mayúscula es el dígito "1".
+- Si un token parece ruido sin letras ni dígitos reconocibles (ej. "DEZOZS"), ignoralo.
+
+- {date_constraint}
+- Si el año inferido es mayor a {max_year}, es un error OCR (probablemente Z→2).
+- Comprometete con tu mejor lectura. No te niegues por escritura imperfecta o ruido.
+{partial_hint}
 Respondé ÚNICAMENTE con la fecha en formato ISO YYYY-MM-DD.
 Sin texto adicional. Si es imposible inferir cualquier componente de la fecha, \
 respondé null.\
@@ -155,6 +177,29 @@ def _normalizar_fecha(value: str | None) -> str | None:
         if mes:
             return f"{anio}-{mes}-{dia}"
     return None
+
+
+def _build_partial_hint(fecha: "Fecha | None") -> str:
+    """Returns a prompt snippet differentiating confirmed OCR slots from those needing inference."""
+    if fecha is None or not (fecha.any_known() or fecha.dia_raw or fecha.mes_raw or fecha.anno_raw):
+        return ""
+    lines = ["- El OCR procesó la estructura DIA DE MES DE AÑO:"]
+    for label, validated, raw in [
+        ("Día", fecha.dia, fecha.dia_raw),
+        ("Mes", fecha.mes, fecha.mes_raw),
+        ("Año", fecha.anno, fecha.anno_raw),
+    ]:
+        if validated is not None:
+            lines.append(f"    {label}: CONFIRMADO = {validated}  (OCR raw: {raw!r})")
+        elif raw:
+            lines.append(f"    {label}: INFERIR desde token OCR = {raw!r}")
+        else:
+            lines.append(f"    {label}: sin datos")
+    lines.append(
+        "  Usá exactamente el valor de los slots CONFIRMADOS. "
+        "Aplicá las reglas de confusión OCR solo para los slots a INFERIR."
+    )
+    return "\n".join(lines)
 
 
 def _tokens_a_texto(ocr_tokens: list[OCRResult]) -> str:
@@ -226,12 +271,23 @@ class LLMValidator:
         ]
         return self._backend.chat(messages)
 
-    def infer_fecha(self, fecha_tokens: list[OCRResult], today_max: str) -> LLMExtractionResult:
-        """Infiere la fecha de emisión a partir de los tokens crudos del crop de fecha.
+    def infer_fecha(
+        self,
+        fecha_tokens: list[OCRResult],
+        today_max: str | None = None,
+        max_future_days: int | None = None,
+        partial_fecha: "Fecha | None" = None,
+    ) -> LLMExtractionResult:
+        """Infiere una fecha a partir de los tokens crudos del crop de fecha.
 
-        Hace una llamada focalizada al LLM pasándole exactamente los caracteres que
-        el OCR leyó, con las reglas de inferencia de meses y la restricción de que
-        la fecha no puede ser futura.
+        Args:
+            fecha_tokens: Tokens OCR de la línea de fecha.
+            today_max: Fecha máxima en formato ISO (para fecha_emision, debe ser <= hoy).
+            max_future_days: Si se indica, la fecha puede ser futura hasta este número
+                de días desde hoy (para fecha_pago; típicamente 365).
+                Si se pasan ambos, today_max tiene precedencia.
+            partial_fecha: Componentes que el OCR ya reconoció con certeza. El LLM
+                debe usarlos como base y solo inferir los que falten.
         """
         if not fecha_tokens:
             return _FAILED_RESULT
@@ -240,12 +296,38 @@ class LLMValidator:
             t.text for t in sorted(fecha_tokens, key=lambda t: t.cx) if t.text.strip()
         )
         logger.info("infer_fecha tokens: %s", tokens_txt)
+        if partial_fecha is not None and (partial_fecha.any_known() or partial_fecha.dia_raw):
+            logger.info(
+                "infer_fecha fecha: dia=%r(raw=%r) mes=%r(raw=%r) anno=%r(raw=%r)",
+                partial_fecha.dia, partial_fecha.dia_raw,
+                partial_fecha.mes, partial_fecha.mes_raw,
+                partial_fecha.anno, partial_fecha.anno_raw,
+            )
+        else:
+            logger.info("infer_fecha partial: none")
 
-        max_year = today_max[:4]
+        # Compute the effective upper bound for the date
+        if today_max is not None:
+            fecha_tope = today_max
+        elif max_future_days is not None:
+            fecha_tope = (date.today() + timedelta(days=max_future_days)).isoformat()
+        else:
+            fecha_tope = None
+
+        if fecha_tope is not None:
+            date_constraint = f"La fecha NO puede ser posterior a {fecha_tope}."
+            max_year = fecha_tope[:4]
+        else:
+            date_constraint = "No hay restricción de fecha futura para este campo."
+            max_year = str(date.today().year + 2)
+
+        partial_hint = _build_partial_hint(partial_fecha)
+
         user_msg = _FECHA_USER_TEMPLATE.format(
             tokens=tokens_txt,
-            today_max=today_max,
+            date_constraint=date_constraint,
             max_year=max_year,
+            partial_hint=partial_hint,
         )
         messages = [
             {"role": "system", "content": _FECHA_SYSTEM_PROMPT},
@@ -266,8 +348,8 @@ class LLMValidator:
             logger.warning("infer_fecha: formato inesperado del LLM: %r", candidate[:80])
             return _FAILED_RESULT
 
-        if normalized > today_max:
-            logger.warning("infer_fecha: fecha futura rechazada: %s > %s", normalized, today_max)
+        if fecha_tope is not None and normalized > fecha_tope:
+            logger.warning("infer_fecha: fecha rechazada: %s > %s", normalized, fecha_tope)
             return _FAILED_RESULT
 
         return LLMExtractionResult(
