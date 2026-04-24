@@ -1,7 +1,7 @@
 """Orquestador de extraccion de campos de cheques.
 
-Coordina MontoExtractor, FechaEmisionExtractor y LLMValidator para producir
-un DatosCheque completo a partir de la imagen de un cheque.
+Coordina MontoExtractor, FechaEmisionExtractor, FechaPagoExtractor y LLMValidator
+para producir un DatosCheque completo a partir de la imagen de un cheque.
 """
 
 import logging
@@ -14,12 +14,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .fecha_emision_extractor import FechaEmisionExtractor
+from .fecha_pago_extractor import FechaPagoExtractor
 from ..models import DatosCheque
 from .monto_extractor import MontoExtractor
 from ..ocr.ocr_readers import OCRReader
 
 if TYPE_CHECKING:
-    from ..llm.llm_validator import LLMValidator
+    from ..llm.llm_validator import LLMValidator, LLMExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class ChequeExtractor:
     ):
         self._monto_ext = MontoExtractor(ocr_reader)
         self._fecha_ext = FechaEmisionExtractor(ocr_reader)
+        self._fecha_pago_ext = FechaPagoExtractor(ocr_reader)
         self._llm = llm_validator
 
     def extraer(
@@ -41,7 +43,7 @@ class ChequeExtractor:
         cheque_img: np.ndarray,
         debug_dir: Path | None = None,
     ) -> DatosCheque:
-        """Extrae monto y fecha_emision de un cheque.
+        """Extrae todos los campos de un cheque.
 
         Args:
             cheque_img: Imagen RGB del cheque recortado.
@@ -49,44 +51,50 @@ class ChequeExtractor:
         Returns:
             DatosCheque con todos los campos extraidos.
         """
-        # ---- OCR ----
         t0 = time.perf_counter()
         monto_result = self._monto_ext.extraer(cheque_img, debug_dir=debug_dir)
         fecha_result = self._fecha_ext.extraer(cheque_img, debug_dir=debug_dir)
-        ocr_elapsed = time.perf_counter() - t0
+        fecha_pago_result = self._fecha_pago_ext.extraer(cheque_img, debug_dir=debug_dir)
         logger.info(
-            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_tokens=%d): %.1fs",
-            len(monto_result.zona_tokens), fecha_result.fecha_iso, len(fecha_result.tokens), ocr_elapsed,
+            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_pago_iso=%r, fecha_tokens=%d): %.1fs",
+            len(monto_result.zona_tokens), fecha_result.fecha_iso,
+            fecha_pago_result.fecha_iso, len(fecha_result.tokens),
+            time.perf_counter() - t0,
         )
 
         monto = monto_result.monto
         monto_raw = monto_result.monto_raw
         fecha_emision = fecha_result.fecha_iso
+        fecha_pago = fecha_pago_result.fecha_iso
         monto_llm_confidence = None
         fecha_llm_confidence = None
+        fecha_pago_llm_confidence = None
 
         if self._llm is not None:
             today_max = date.today().isoformat()
-            fecha_future = None
-            monto_future = None
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                if fecha_emision is None:
-                    fecha_future = pool.submit(self._llm.infer_fecha, fecha_result.tokens, today_max)
-                if monto is None:
-                    monto_future = pool.submit(self._llm.extract_fields, monto_result.zona_tokens, [])
-            if fecha_future is not None:
-                llm_fecha = fecha_future.result()
-                logger.info("LLM fecha: %r conf=%.2f", llm_fecha.normalized, llm_fecha.confidence)
-                if llm_fecha.normalized is not None:
-                    fecha_emision = llm_fecha.normalized
-                    fecha_llm_confidence = llm_fecha.confidence
-            if monto_future is not None:
-                llm_monto = monto_future.result().get("monto")
-                if llm_monto and llm_monto.normalized is not None and llm_monto.confidence >= 0.70:
-                    logger.info("LLM monto: %r conf=%.2f", llm_monto.normalized, llm_monto.confidence)
-                    monto = llm_monto.normalized
-                    monto_raw = llm_monto.value or monto_raw
-                    monto_llm_confidence = llm_monto.confidence
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fecha_future = (
+                    pool.submit(self._llm.infer_fecha, fecha_result.tokens, today_max)
+                    if fecha_emision is None else None
+                )
+                fecha_pago_future = (
+                    pool.submit(self._llm.infer_fecha, fecha_pago_result.tokens, None, 365)
+                    if fecha_pago is None else None
+                )
+                monto_future = (
+                    pool.submit(self._llm.extract_fields, monto_result.zona_tokens, [])
+                    if monto is None else None
+                )
+
+            fecha_emision, fecha_llm_confidence = self._resolve_fecha(
+                fecha_future, "fecha_emision", fecha_emision, fecha_llm_confidence
+            )
+            fecha_pago, fecha_pago_llm_confidence = self._resolve_fecha(
+                fecha_pago_future, "fecha_pago", fecha_pago, fecha_pago_llm_confidence
+            )
+            monto, monto_raw, monto_llm_confidence = self._resolve_monto(
+                monto_future, monto, monto_raw
+            )
 
         return DatosCheque(
             monto=monto,
@@ -96,4 +104,27 @@ class ChequeExtractor:
             fecha_emision=fecha_emision,
             fecha_emision_raw=fecha_emision,
             fecha_emision_llm_confidence=fecha_llm_confidence,
+            fecha_pago=fecha_pago,
+            fecha_pago_raw=fecha_pago,
+            fecha_pago_llm_confidence=fecha_pago_llm_confidence,
         )
+
+    @staticmethod
+    def _resolve_fecha(future, field_name, current_value, current_conf):
+        if future is None:
+            return current_value, current_conf
+        result: "LLMExtractionResult" = future.result()
+        logger.info("LLM %s: %r conf=%.2f", field_name, result.normalized, result.confidence)
+        if result.normalized is not None:
+            return result.normalized, result.confidence
+        return current_value, current_conf
+
+    @staticmethod
+    def _resolve_monto(future, current_monto, current_raw):
+        if future is None:
+            return current_monto, current_raw, None
+        llm_monto = future.result().get("monto")
+        if llm_monto and llm_monto.normalized is not None and llm_monto.confidence >= 0.70:
+            logger.info("LLM monto: %r conf=%.2f", llm_monto.normalized, llm_monto.confidence)
+            return llm_monto.normalized, llm_monto.value or current_raw, llm_monto.confidence
+        return current_monto, current_raw, None

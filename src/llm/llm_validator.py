@@ -13,6 +13,7 @@ import json
 import re
 import logging
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from .llm_backends import LLMBackend
@@ -120,7 +121,7 @@ Reglas específicas para el DÍA — confusión "I" (letra) ↔ "1" (dígito):
   Regla general: en el campo día, toda "I" mayúscula es el dígito "1".
 - Si un token parece ruido sin letras ni dígitos reconocibles (ej. "DEZOZS"), ignoralo.
 
-- La fecha de emisión NO puede ser futura. Fecha máxima permitida: {today_max}
+- {date_constraint}
 - Si el año inferido es mayor a {max_year}, es un error OCR (probablemente Z→2).
 - Comprometete con tu mejor lectura. No te niegues por escritura imperfecta o ruido.
 
@@ -246,12 +247,20 @@ class LLMValidator:
         ]
         return self._backend.chat(messages)
 
-    def infer_fecha(self, fecha_tokens: list[OCRResult], today_max: str) -> LLMExtractionResult:
-        """Infiere la fecha de emisión a partir de los tokens crudos del crop de fecha.
+    def infer_fecha(
+        self,
+        fecha_tokens: list[OCRResult],
+        today_max: str | None = None,
+        max_future_days: int | None = None,
+    ) -> LLMExtractionResult:
+        """Infiere una fecha a partir de los tokens crudos del crop de fecha.
 
-        Hace una llamada focalizada al LLM pasándole exactamente los caracteres que
-        el OCR leyó, con las reglas de inferencia de meses y la restricción de que
-        la fecha no puede ser futura.
+        Args:
+            fecha_tokens: Tokens OCR de la línea de fecha.
+            today_max: Fecha máxima en formato ISO (para fecha_emision, debe ser <= hoy).
+            max_future_days: Si se indica, la fecha puede ser futura hasta este número
+                de días desde hoy (para fecha_pago; típicamente 365).
+                Si se pasan ambos, today_max tiene precedencia.
         """
         if not fecha_tokens:
             return _FAILED_RESULT
@@ -261,10 +270,24 @@ class LLMValidator:
         )
         logger.info("infer_fecha tokens: %s", tokens_txt)
 
-        max_year = today_max[:4]
+        # Compute the effective upper bound for the date
+        if today_max is not None:
+            fecha_tope = today_max
+        elif max_future_days is not None:
+            fecha_tope = (date.today() + timedelta(days=max_future_days)).isoformat()
+        else:
+            fecha_tope = None
+
+        if fecha_tope is not None:
+            date_constraint = f"La fecha NO puede ser posterior a {fecha_tope}."
+            max_year = fecha_tope[:4]
+        else:
+            date_constraint = "No hay restricción de fecha futura para este campo."
+            max_year = str(date.today().year + 2)
+
         user_msg = _FECHA_USER_TEMPLATE.format(
             tokens=tokens_txt,
-            today_max=today_max,
+            date_constraint=date_constraint,
             max_year=max_year,
         )
         messages = [
@@ -286,8 +309,8 @@ class LLMValidator:
             logger.warning("infer_fecha: formato inesperado del LLM: %r", candidate[:80])
             return _FAILED_RESULT
 
-        if normalized > today_max:
-            logger.warning("infer_fecha: fecha futura rechazada: %s > %s", normalized, today_max)
+        if fecha_tope is not None and normalized > fecha_tope:
+            logger.warning("infer_fecha: fecha rechazada: %s > %s", normalized, fecha_tope)
             return _FAILED_RESULT
 
         return LLMExtractionResult(

@@ -21,6 +21,11 @@ class DatosCheque:
     fecha_emision_raw: str | None = None    # tal como lo leyo el LLM
     fecha_emision_llm_confidence: float | None = None
 
+    # Fecha de pago
+    fecha_pago: str | None = None           # ISO: "YYYY-MM-DD"
+    fecha_pago_raw: str | None = None
+    fecha_pago_llm_confidence: float | None = None
+
     # Metadata
     imagen_path: str = ""
     pdf_origen: str = ""
