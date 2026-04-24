@@ -104,12 +104,20 @@ cada prefijo es único salvo los indicados:
   Ag / Ago              → Agosto    (único con Ag)
   Se / Sep              → Septiembre (único con Se)
   Oc / Oct              → Octubre   (único con Oc)
-  No / Nov / Nor        → Noviembre (único con No)
+  No / Nov / Nor / Norr → Noviembre (ÚNICO mes que empieza con "No"; si ves cualquier "No..." el mes ES Noviembre, no existe otro)
   Di / Dic              → Diciembre (único con Di)
 
 Reglas para DÍGITOS (confusiones OCR frecuentes):
   Z↔2, o/O↔0, l↔1, S↔5, G↔6, B↔8
   Ejemplos: "Z025" → 2025, "ZoZ6" → 2026, "l6" → 16
+
+Reglas específicas para el DÍA — confusión "I" (letra) ↔ "1" (dígito):
+  "I"         → 1   (ej: "I" solo → día 1)
+  "II"        → 11
+  "I1" o "1I" → 11
+  "I" + dígito N → 1N  (ej: "I2"→12, "I3"→13, "I4"→14, ... "I9"→19)
+  dígito N + "I" → N1  (ej: "3I"→31, "2I"→21, "1I"→11)
+  Regla general: en el campo día, toda "I" mayúscula es el dígito "1".
 - Si un token parece ruido sin letras ni dígitos reconocibles (ej. "DEZOZS"), ignoralo.
 
 - La fecha de emisión NO puede ser futura. Fecha máxima permitida: {today_max}

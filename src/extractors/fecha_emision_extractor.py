@@ -11,17 +11,12 @@ Estrategia hibrida:
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
-
-if TYPE_CHECKING:
-    from ..llm.llm_validator import LLMValidator
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +30,7 @@ def _es_token_fecha(text: str) -> bool:
     t = text.strip().lower()
     if t in _MESES_NOMBRES:
         return True
-    if re.match(r'^20\d{2}$', t):
+    if _ANNO_RE.match(t):
         return True
     return False
 
@@ -51,6 +46,10 @@ _EL_INICIO_RE = re.compile(r'^[Ee][Ll]')
 
 # Tokens que identifican el boilerplate "La fecha de pago no puede exceder un plazo de 360 dias"
 _BOILERPLATE_RE = re.compile(r'^(360|dias?)$', re.IGNORECASE)
+# Ancla fiable para el limite inferior del fallback: 'plazo' de la leyenda 'plazo de 360 dias'
+_PLAZO_360_RE = re.compile(r'^plazo$', re.IGNORECASE)
+
+_ANNO_RE = re.compile(r'^20\d{2}$')
 
 _DEBUG_FECHA_ZONA = "fecha_zona.png"
 _VENTANA_CY = 0.07
@@ -109,13 +108,48 @@ def _limpiar_ano(text: str) -> str:
     return text
 
 
-def _filtrar_tokens_fecha_estructura(tokens: list[OCRResult]) -> list[OCRResult]:
-    """Extrae DIA/MES/ANNO de los tokens y los devuelve como un unico token combinado."""
+_DE_EMBEDDED_SPLIT_RE = re.compile(r'(DE)')
+
+
+def _expandir_tokens_de(tokens: list[OCRResult]) -> list[OCRResult]:
+    """Split tokens with embedded uppercase 'DE' into sub-tokens.
+
+    Only splits when DE is adjacent to a digit or sits at the start of the token
+    (e.g. '16DE' → ['16','DE'], 'DEZOZS' → ['DE','ZOZS'], 'DEZ025' → ['DE','Z025']).
+    Pure-word tokens like 'FEDERAL' are left untouched because no digit is adjacent.
+    """
+    result: list[OCRResult] = []
+    for t in tokens:
+        text = t.text.strip()
+        if _DE_MAYUS_RE.match(text):
+            result.append(t)
+            continue
+        has_embedded = bool(re.search(r'\dDE|DE\d', text) or re.match(r'^DE.', text))
+        if not has_embedded:
+            result.append(t)
+            continue
+        partes = [p for p in _DE_EMBEDDED_SPLIT_RE.split(text) if p]
+        for p in partes:
+            result.append(OCRResult(text=p, confidence=t.confidence, cx=t.cx, cy=t.cy, height=t.height))
+    return result
+
+
+def _filtrar_tokens_fecha_estructura(
+    tokens: list[OCRResult],
+) -> tuple[list[OCRResult], list[OCRResult]]:
+    """Extrae DIA/MES/ANNO de los tokens.
+
+    Returns:
+        (combined, source_tokens): combined is a single-element list with the assembled
+        date string; source_tokens contains only the tokens that formed the structure
+        (noise stripped). When fewer than 2 DE are found, returns (tokens, tokens).
+    """
+    tokens = _expandir_tokens_de(tokens)
     de_indices = [i for i, t in enumerate(tokens) if _DE_MAYUS_RE.match(t.text.strip())]
 
     if len(de_indices) < 2:
         logger.info("Estructura fecha: menos de 2 'DE' encontrados, retornando tokens originales")
-        return tokens
+        return tokens, tokens
 
     idx_de1 = de_indices[0]
     idx_de2 = de_indices[1]
@@ -141,25 +175,46 @@ def _filtrar_tokens_fecha_estructura(tokens: list[OCRResult]) -> list[OCRResult]
     mes_text = _limpiar_mes(mes_raw)
     anio_text = _limpiar_ano(anio_raw)
 
+    # Fallback: year may appear before the DE...DE structure due to OCR ordering or
+    # because splitting an embedded DE (e.g. DEENERO) shifted the year out of position.
+    if not _ANNO_RE.match(anio_text):
+        assigned_ids = (
+            {id(dia_token)} if dia_token else set()
+        ) | {id(tokens[idx_de1]), id(tokens[idx_de2])} | {id(t) for t in mes_tokens}
+        for t in tokens:
+            if id(t) in assigned_ids:
+                continue
+            y = _limpiar_ano(t.text.strip())
+            if _ANNO_RE.match(y):
+                anio_token = t
+                anio_raw = t.text.strip()
+                anio_text = y
+                break
+
     fecha_completa = f"{dia_text} DE {mes_text} DE {anio_text}"
     logger.info(
         "Estructura fecha: DIA=%r (limpio: %r), MES=%r (limpio: %r), ANNO=%r (limpio: %r) -> %r",
         dia_raw, dia_text, mes_raw, mes_text, anio_raw, anio_text, fecha_completa,
     )
 
-    return [OCRResult(text=fecha_completa, confidence=1.0, cx=0.5, cy=0.5, height=0.1)]
+    source_tokens: list[OCRResult] = []
+    if dia_token:
+        source_tokens.append(dia_token)
+    source_tokens.append(tokens[idx_de1])
+    source_tokens.extend(mes_tokens)
+    source_tokens.append(tokens[idx_de2])
+    if anio_token:
+        source_tokens.append(anio_token)
+    source_tokens = [t for t in source_tokens if t.text.strip()]
+
+    return [OCRResult(text=fecha_completa, confidence=1.0, cx=0.5, cy=0.5, height=0.1)], source_tokens
 
 
 class FechaEmisionExtractor:
     """Extrae la fecha de emision de un cheque via OCR sobre el scan amplio."""
 
-    def __init__(
-        self,
-        ocr_reader: OCRReader,
-        llm_validator: "LLMValidator | None" = None,
-    ):
+    def __init__(self, ocr_reader: OCRReader):
         self._ocr = ocr_reader
-        self._llm = llm_validator
 
     def extraer(
         self,
@@ -174,37 +229,18 @@ class FechaEmisionExtractor:
         logger.info("Tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
 
         # 1. Ciudad-coma anchor
-        ciudad_coma = self._encontrar_ciudad_coma(tokens_scan)
-        if ciudad_coma is not None:
-            cy_emision = ciudad_coma.cy
-            logger.info("Ciudad-coma ancla: token=%r cy=%.3f", ciudad_coma.text, cy_emision)
-            scan_window = [
-                t for t in tokens_scan
-                if abs(t.cy - cy_emision) < _VENTANA_CY and t.cx > ciudad_coma.cx
-            ]
-            logger.info("Scan window (cy=%.3f +-%.3f, cx>%.3f): %s", cy_emision, _VENTANA_CY, ciudad_coma.cx, [(t.text, round(t.cy, 3)) for t in scan_window])
-            if debug_dir is not None:
-                fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
-                Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
-            if scan_window:
-                result = self._result_desde_scan_window(scan_window)
-                return result if result.fecha_iso else self._llm_fallback(result)
+        result = self._extraer_por_ciudad_coma(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        if result is not None:
+            return result
 
         # 2. DE-cluster / EL-anchor
-        cy_emision = self._detectar_cy_emision(tokens_scan)
-        if cy_emision is not None:
-            scan_window = [t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY]
-            logger.info("Scan window (cy=%.3f +-%.3f): %s", cy_emision, _VENTANA_CY, [(t.text, round(t.cy, 3)) for t in scan_window])
-            if debug_dir is not None:
-                fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
-                Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
-            if scan_window:
-                result = self._result_desde_scan_window(scan_window)
-                return result if result.fecha_iso else self._llm_fallback(result)
+        result = self._extraer_por_de_el(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        if result is not None:
+            return result
 
         # 3. Fallback
-        fallback_tokens = self._fallback_fecha(tokens_scan, zona, debug_dir)
-        return self._llm_fallback(FechaEmisionResult(fecha_iso=None, tokens=fallback_tokens))
+        fallback_tokens = self._fallback_zona(tokens_scan, zona, debug_dir)
+        return FechaEmisionResult(fecha_iso=None, tokens=fallback_tokens)
 
     @staticmethod
     def _get_debug_crop(
@@ -229,44 +265,78 @@ class FechaEmisionExtractor:
 
     @staticmethod
     def _result_desde_scan_window(scan_window: list[OCRResult]) -> FechaEmisionResult:
-        filtered = _filtrar_tokens_fecha_estructura(scan_window)
+        filtered, source_tokens = _filtrar_tokens_fecha_estructura(scan_window)
         if len(filtered) == 1:
             iso = _fecha_completa_a_iso(filtered[0].text)
             if iso is not None:
                 logger.info("Fecha completa por OCR: %s", iso)
                 return FechaEmisionResult(fecha_iso=iso, tokens=scan_window)
+            logger.info(
+                "OCR incompleto, retornando tokens estructurales: %s",
+                [t.text for t in source_tokens],
+            )
+            return FechaEmisionResult(fecha_iso=None, tokens=source_tokens)
         logger.info("OCR incompleto, retornando tokens: %s", [t.text for t in scan_window])
         return FechaEmisionResult(fecha_iso=None, tokens=scan_window)
 
-    def _llm_fallback(self, ocr_result: FechaEmisionResult) -> FechaEmisionResult:
-        if self._llm is None:
-            return ocr_result
-        today_max = date.today().isoformat()
-        llm_result = self._llm.infer_fecha(ocr_result.tokens, today_max)
-        logger.info("LLM fecha: %r (conf=%.2f)", llm_result.normalized, llm_result.confidence)
-        if llm_result.normalized is not None:
-            return FechaEmisionResult(fecha_iso=llm_result.normalized, tokens=ocr_result.tokens)
-        return ocr_result
-
-    @staticmethod
-    def _encontrar_ciudad_coma(tokens_scan: list[OCRResult]) -> OCRResult | None:
+    def _extraer_por_ciudad_coma(
+        self,
+        tokens_scan: list[OCRResult],
+        cheque_img: np.ndarray,
+        scan_h: int,
+        scan_x0: int,
+        debug_dir: Path | None,
+    ) -> FechaEmisionResult | None:
         token = next(
             (t for t in tokens_scan if _CIUDAD_COMA_RE.match(t.text.strip()) and t.cy > 0.30),
             None,
         )
-        if token:
-            logger.info("Ciudad-coma: encontrado %r en cy=%.3f", token.text, token.cy)
-        else:
+        if token is None:
             logger.info("Ciudad-coma: no encontrado")
-        return token
+            return None
+        cy_emision = token.cy
+        logger.info("Ciudad-coma ancla: token=%r cy=%.3f", token.text, cy_emision)
+        scan_window = [
+            t for t in tokens_scan
+            if abs(t.cy - cy_emision) < _VENTANA_CY and t.cx > token.cx
+        ]
+        logger.info(
+            "Scan window (cy=%.3f +-%.3f, cx>%.3f): %s",
+            cy_emision, _VENTANA_CY, token.cx, [(t.text, round(t.cy, 3)) for t in scan_window],
+        )
+        if debug_dir is not None:
+            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
+            Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
+        if scan_window:
+            return self._result_desde_scan_window(scan_window)
+        return None
 
-    def _detectar_cy_emision(self, tokens_scan: list[OCRResult]) -> float | None:
+    def _extraer_por_de_el(
+        self,
+        tokens_scan: list[OCRResult],
+        cheque_img: np.ndarray,
+        scan_h: int,
+        scan_x0: int,
+        debug_dir: Path | None,
+    ) -> FechaEmisionResult | None:
         el_token = self._encontrar_el(tokens_scan)
         el_cy = el_token.cy if el_token else None
-        cy = self._cy_por_de_cluster(tokens_scan, el_cy)
-        if cy is not None:
-            return cy
-        return self._cy_por_el_ancla(el_token)
+        cy_emision = self._cy_por_de_cluster(tokens_scan, el_cy)
+        if cy_emision is None:
+            cy_emision = self._cy_por_el_ancla(el_token)
+        if cy_emision is None:
+            return None
+        scan_window = [t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY]
+        logger.info(
+            "Scan window (cy=%.3f +-%.3f): %s",
+            cy_emision, _VENTANA_CY, [(t.text, round(t.cy, 3)) for t in scan_window],
+        )
+        if debug_dir is not None:
+            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
+            Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
+        if scan_window:
+            return self._result_desde_scan_window(scan_window)
+        return None
 
     @staticmethod
     def _encontrar_el(tokens_scan: list[OCRResult]) -> OCRResult | None:
@@ -327,23 +397,38 @@ class FechaEmisionExtractor:
         logger.info("EL-ancla: estimando cy_emision=%.3f (el_cy=%.3f - 1.5*h)", cy_estimado, el_token.cy)
         return cy_estimado
 
-    def _fallback_fecha(
+    def _fallback_zona(
         self,
         tokens_scan: list[OCRResult],
         zona: np.ndarray,
         debug_dir: Path | None,
     ) -> list[OCRResult]:
-        """Fallback: filtra tokens del scan amplio por mes/anno conocido."""
-        fecha_anclas = [t for t in tokens_scan if _es_token_fecha(t.text)]
+        """Fallback general: acota la zona usando el boilerplate '360 dias' como
+        limite inferior y el tope del 40 % de la altura del cheque como techo."""
+        # Top 40 % del cheque en coordenadas relativas al scan (scan_h = 55 % del cheque)
+        cy_techo = 0.40 / 0.55  # ~0.727
+
+        boilerplate_tokens = [t for t in tokens_scan if _PLAZO_360_RE.match(t.text.strip())]
+        if boilerplate_tokens:
+            cy_boilerplate = min(t.cy for t in boilerplate_tokens)
+            cy_techo = min(cy_techo, cy_boilerplate)
+            logger.info("Fallback: limite inferior por 'plazo de 360' cy=%.3f", cy_boilerplate)
+        else:
+            logger.info("Fallback: sin boilerplate, usando techo cy=%.3f", cy_techo)
+
+        tokens_zona = [t for t in tokens_scan if t.cy < cy_techo]
+        logger.info("Fallback: %d tokens en zona (cy < %.3f)", len(tokens_zona), cy_techo)
+
+        fecha_anclas = [t for t in tokens_zona if _es_token_fecha(t.text)]
         if fecha_anclas:
             cy_fila = sum(t.cy for t in fecha_anclas) / len(fecha_anclas)
-            resultado = [t for t in tokens_scan if abs(t.cy - cy_fila) < 0.08]
+            resultado = [t for t in tokens_zona if abs(t.cy - cy_fila) < 0.08]
             logger.info("Fallback por ancla de fecha -> %d tokens", len(resultado))
             if debug_dir is not None:
                 Image.fromarray(zona).save(debug_dir / _DEBUG_FECHA_ZONA)
             return resultado
 
-        logger.info("Sin anclas, devolviendo tokens del scan amplio (%d)", len(tokens_scan))
+        logger.info("Sin anclas, devolviendo tokens de zona superior (%d)", len(tokens_zona))
         if debug_dir is not None:
             Image.fromarray(zona).save(debug_dir / _DEBUG_FECHA_ZONA)
-        return tokens_scan
+        return tokens_zona
