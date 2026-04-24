@@ -39,9 +39,80 @@ _EL_STRIP_RE = re.compile(r'^[Ee][Ll]')
 
 
 @dataclass
+class Fecha:
+    """Date components, each validated or None if ambiguous/unrecognized by OCR.
+
+    Validated slots (dia/mes/anno) hold clean values the code confirmed; raw slots
+    hold the original OCR text so the LLM can reason about unrecognized components.
+    """
+    dia: str | None      # zero-padded day "01"-"31", None if unrecognized
+    mes: str | None      # month number "01"-"12", None if unrecognized
+    anno: str | None     # 4-digit year "2020"-"2030", None if out of range
+    dia_raw: str | None = None   # raw OCR text for day slot
+    mes_raw: str | None = None   # raw OCR text for month slot
+    anno_raw: str | None = None  # raw OCR text for year slot
+
+    def to_iso(self) -> str | None:
+        if self.dia and self.mes and self.anno:
+            return f"{self.anno}-{self.mes}-{self.dia}"
+        return None
+
+    def any_known(self) -> bool:
+        return any(v is not None for v in (self.dia, self.mes, self.anno))
+
+    def all_known(self) -> bool:
+        return all(v is not None for v in (self.dia, self.mes, self.anno))
+
+
+# Keep alias for any external code that still references PartialFecha
+PartialFecha = Fecha
+
+
+@dataclass
 class FechaResult:
     fecha_iso: str | None
     tokens: list[OCRResult]
+    partial: "Fecha | None" = None
+
+
+def _validar_componentes(
+    dia_raw: str | None,
+    mes_raw: str | None,
+    anno_raw: str | None,
+) -> Fecha:
+    """Validates raw OCR text per slot. Returns Fecha with clean values where unambiguous.
+
+    Only accepts values the code can confirm with certainty:
+      - day: numeric 1-31
+      - month: recognized Spanish month name
+      - year: exactly 20XX in range 2020-2030 (e.g. "2076" stays None → LLM fixes it)
+    """
+    dia = None
+    if dia_raw:
+        for d in re.findall(r'\d+', dia_raw):
+            n = int(d)
+            if 1 <= n <= 31:
+                dia = str(n).zfill(2)
+                break
+
+    mes = None
+    if mes_raw:
+        for nombre, num in _MES_A_NUM.items():
+            if nombre in mes_raw.lower():
+                mes = num
+                break
+
+    anno = None
+    if anno_raw:
+        for y_str in re.findall(r'\d{4}', anno_raw):
+            if 2020 <= int(y_str) <= 2030:
+                anno = y_str
+                break
+
+    return Fecha(
+        dia=dia, mes=mes, anno=anno,
+        dia_raw=dia_raw, mes_raw=mes_raw, anno_raw=anno_raw,
+    )
 
 
 def _es_token_fecha(text: str) -> bool:
@@ -151,13 +222,14 @@ def _buscar_anno_fallback(
 def _filtrar_tokens_fecha_estructura(
     tokens: list[OCRResult],
     skip_el_prefix: bool = False,
-) -> tuple[list[OCRResult], list[OCRResult]]:
+) -> tuple[list[OCRResult], list[OCRResult], "PartialFecha | None"]:
     """Extrae DIA/MES/ANNO de los tokens.
 
     Returns:
-        (combined, source_tokens): combined is a single-element list with the assembled
-        date string; source_tokens contains only the tokens that formed the structure.
-        When fewer than 2 DE are found, returns (tokens, tokens).
+        (combined, source_tokens, partial): combined is a single-element list with the
+        assembled date string; source_tokens contains only the tokens that formed the
+        structure; partial holds whichever components OCR did recognize (None = not found).
+        When fewer than 2 DE are found, returns (tokens, tokens, None).
 
     skip_el_prefix: pass True for fecha_pago lines that begin with 'EL'.
     """
@@ -166,7 +238,7 @@ def _filtrar_tokens_fecha_estructura(
 
     if len(de_indices) < 2:
         logger.info("Estructura fecha: menos de 2 'DE' encontrados, retornando tokens originales")
-        return tokens, tokens
+        return tokens, tokens, None
 
     idx_de1, idx_de2 = de_indices[0], de_indices[1]
 
@@ -216,9 +288,16 @@ def _filtrar_tokens_fecha_estructura(
     if anio_token:
         source_tokens.append(anio_token)
 
+    fecha = _validar_componentes(
+        dia_raw if dia_raw else None,
+        mes_raw if mes_raw else None,
+        anio_raw if anio_raw else None,
+    )
+
     return (
         [OCRResult(text=fecha_completa, confidence=1.0, cx=0.5, cy=0.5, height=0.1)],
         [t for t in source_tokens if t.text.strip()],
+        fecha,
     )
 
 

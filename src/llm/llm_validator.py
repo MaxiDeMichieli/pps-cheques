@@ -18,6 +18,7 @@ from typing import Any
 
 from .llm_backends import LLMBackend
 from ..ocr.ocr_readers import OCRResult
+from ..extractors.fecha_extractor import Fecha
 
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ Reglas específicas para el DÍA — confusión "I" (letra) ↔ "1" (dígito):
 - {date_constraint}
 - Si el año inferido es mayor a {max_year}, es un error OCR (probablemente Z→2).
 - Comprometete con tu mejor lectura. No te niegues por escritura imperfecta o ruido.
-
+{partial_hint}
 Respondé ÚNICAMENTE con la fecha en formato ISO YYYY-MM-DD.
 Sin texto adicional. Si es imposible inferir cualquier componente de la fecha, \
 respondé null.\
@@ -176,6 +177,29 @@ def _normalizar_fecha(value: str | None) -> str | None:
         if mes:
             return f"{anio}-{mes}-{dia}"
     return None
+
+
+def _build_partial_hint(fecha: "Fecha | None") -> str:
+    """Returns a prompt snippet differentiating confirmed OCR slots from those needing inference."""
+    if fecha is None or not (fecha.any_known() or fecha.dia_raw or fecha.mes_raw or fecha.anno_raw):
+        return ""
+    lines = ["- El OCR procesó la estructura DIA DE MES DE AÑO:"]
+    for label, validated, raw in [
+        ("Día", fecha.dia, fecha.dia_raw),
+        ("Mes", fecha.mes, fecha.mes_raw),
+        ("Año", fecha.anno, fecha.anno_raw),
+    ]:
+        if validated is not None:
+            lines.append(f"    {label}: CONFIRMADO = {validated}  (OCR raw: {raw!r})")
+        elif raw:
+            lines.append(f"    {label}: INFERIR desde token OCR = {raw!r}")
+        else:
+            lines.append(f"    {label}: sin datos")
+    lines.append(
+        "  Usá exactamente el valor de los slots CONFIRMADOS. "
+        "Aplicá las reglas de confusión OCR solo para los slots a INFERIR."
+    )
+    return "\n".join(lines)
 
 
 def _tokens_a_texto(ocr_tokens: list[OCRResult]) -> str:
@@ -252,6 +276,7 @@ class LLMValidator:
         fecha_tokens: list[OCRResult],
         today_max: str | None = None,
         max_future_days: int | None = None,
+        partial_fecha: "Fecha | None" = None,
     ) -> LLMExtractionResult:
         """Infiere una fecha a partir de los tokens crudos del crop de fecha.
 
@@ -261,6 +286,8 @@ class LLMValidator:
             max_future_days: Si se indica, la fecha puede ser futura hasta este número
                 de días desde hoy (para fecha_pago; típicamente 365).
                 Si se pasan ambos, today_max tiene precedencia.
+            partial_fecha: Componentes que el OCR ya reconoció con certeza. El LLM
+                debe usarlos como base y solo inferir los que falten.
         """
         if not fecha_tokens:
             return _FAILED_RESULT
@@ -269,6 +296,15 @@ class LLMValidator:
             t.text for t in sorted(fecha_tokens, key=lambda t: t.cx) if t.text.strip()
         )
         logger.info("infer_fecha tokens: %s", tokens_txt)
+        if partial_fecha is not None and (partial_fecha.any_known() or partial_fecha.dia_raw):
+            logger.info(
+                "infer_fecha fecha: dia=%r(raw=%r) mes=%r(raw=%r) anno=%r(raw=%r)",
+                partial_fecha.dia, partial_fecha.dia_raw,
+                partial_fecha.mes, partial_fecha.mes_raw,
+                partial_fecha.anno, partial_fecha.anno_raw,
+            )
+        else:
+            logger.info("infer_fecha partial: none")
 
         # Compute the effective upper bound for the date
         if today_max is not None:
@@ -285,10 +321,13 @@ class LLMValidator:
             date_constraint = "No hay restricción de fecha futura para este campo."
             max_year = str(date.today().year + 2)
 
+        partial_hint = _build_partial_hint(partial_fecha)
+
         user_msg = _FECHA_USER_TEMPLATE.format(
             tokens=tokens_txt,
             date_constraint=date_constraint,
             max_year=max_year,
+            partial_hint=partial_hint,
         )
         messages = [
             {"role": "system", "content": _FECHA_SYSTEM_PROMPT},

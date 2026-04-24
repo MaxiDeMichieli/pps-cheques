@@ -23,6 +23,7 @@ from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
 from .fecha_extractor import (
+    Fecha,
     FechaResult,
     _agrupar_de_clusters,
     _es_token_fecha,
@@ -54,24 +55,25 @@ class FechaPagoExtractor:
         h, w = cheque_img.shape[:2]
         scan_h = int(h * 0.55)
         scan_x0 = int(w * 0.10)
-        zona = cheque_img[0:scan_h, scan_x0:w]
+        scan_x1 = int(w * 0.70)
+        zona = cheque_img[0:scan_h, scan_x0:scan_x1]
         tokens_scan = self._ocr.read(zona)
         logger.info("FechaPago tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
 
         # 1. EL anchor — same line as fecha_pago
-        result = self._extraer_por_el(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        result = self._extraer_por_el(tokens_scan, cheque_img, scan_h, scan_x0, scan_x1, debug_dir)
         if result is not None:
             logger.info("FechaPago anchor=EL iso=%r", result.fecha_iso)
             return result
 
         # 2. PAGUESE anchor — fecha_pago is one line above it
-        result = self._extraer_por_paguese(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        result = self._extraer_por_paguese(tokens_scan, cheque_img, scan_h, scan_x0, scan_x1, debug_dir)
         if result is not None:
             logger.info("FechaPago anchor=PAGUESE iso=%r", result.fecha_iso)
             return result
 
         # 3. Lower DE cluster
-        result = self._extraer_por_de_cluster_inferior(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        result = self._extraer_por_de_cluster_inferior(tokens_scan, cheque_img, scan_h, scan_x0, scan_x1, debug_dir)
         if result is not None:
             logger.info("FechaPago anchor=DE-cluster iso=%r", result.fecha_iso)
             return result
@@ -92,6 +94,7 @@ class FechaPagoExtractor:
         cy_pago: float,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
     ) -> np.ndarray:
         ancla = next(
             (t for t in tokens_scan if abs(t.cy - cy_pago) < _VENTANA_CY and t.height > 0),
@@ -103,11 +106,11 @@ class FechaPagoExtractor:
         margen_px = int(token_h_px * 1.5)
         y0 = max(0, centro_px - margen_px)
         y1 = min(scan_h, centro_px + margen_px)
-        return cheque_img[y0:y1, scan_x0:]
+        return cheque_img[y0:y1, scan_x0:scan_x1]
 
     @staticmethod
     def _result_desde_scan_window(scan_window: list[OCRResult]) -> FechaResult:
-        filtered, source_tokens = _filtrar_tokens_fecha_estructura(scan_window)
+        filtered, source_tokens, partial = _filtrar_tokens_fecha_estructura(scan_window)
         if len(filtered) == 1:
             iso = _fecha_completa_a_iso(filtered[0].text)
             if iso is not None:
@@ -117,7 +120,7 @@ class FechaPagoExtractor:
                 "FechaPago OCR incompleto, tokens estructurales: %s",
                 [t.text for t in source_tokens],
             )
-            return FechaResult(fecha_iso=None, tokens=source_tokens)
+            return FechaResult(fecha_iso=None, tokens=source_tokens, partial=partial)
         logger.info("FechaPago OCR incompleto, tokens: %s", [t.text for t in scan_window])
         return FechaResult(fecha_iso=None, tokens=scan_window)
 
@@ -131,6 +134,7 @@ class FechaPagoExtractor:
         cheque_img: np.ndarray,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
         debug_dir: Path | None,
     ) -> FechaResult | None:
         candidates = [t for t in tokens_scan if _EL_INICIO_RE.match(t.text.strip()) and t.cy > 0.35]
@@ -145,7 +149,7 @@ class FechaPagoExtractor:
             el_token.cy, _VENTANA_CY, [(t.text, round(t.cy, 3)) for t in scan_window],
         )
         if debug_dir is not None:
-            crop = self._get_debug_crop(cheque_img, tokens_scan, el_token.cy, scan_h, scan_x0)
+            crop = self._get_debug_crop(cheque_img, tokens_scan, el_token.cy, scan_h, scan_x0, scan_x1)
             Image.fromarray(crop).save(debug_dir / _DEBUG_FECHA_PAGO_ZONA)
         if scan_window:
             return self._result_desde_scan_window(scan_window)
@@ -157,6 +161,7 @@ class FechaPagoExtractor:
         cheque_img: np.ndarray,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
         debug_dir: Path | None,
     ) -> FechaResult | None:
         paguese_token = next(
@@ -178,7 +183,7 @@ class FechaPagoExtractor:
             cy_pago, _VENTANA_CY, [(t.text, round(t.cy, 3)) for t in scan_window],
         )
         if debug_dir is not None:
-            crop = self._get_debug_crop(cheque_img, tokens_scan, cy_pago, scan_h, scan_x0)
+            crop = self._get_debug_crop(cheque_img, tokens_scan, cy_pago, scan_h, scan_x0, scan_x1)
             Image.fromarray(crop).save(debug_dir / _DEBUG_FECHA_PAGO_ZONA)
         if scan_window:
             return self._result_desde_scan_window(scan_window)
@@ -190,6 +195,7 @@ class FechaPagoExtractor:
         cheque_img: np.ndarray,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
         debug_dir: Path | None,
     ) -> FechaResult | None:
         de_tokens = sorted(
@@ -223,7 +229,7 @@ class FechaPagoExtractor:
         )
         scan_window = [t for t in tokens_scan if abs(t.cy - cy_centro) < _VENTANA_CY]
         if debug_dir is not None:
-            crop = self._get_debug_crop(cheque_img, tokens_scan, cy_centro, scan_h, scan_x0)
+            crop = self._get_debug_crop(cheque_img, tokens_scan, cy_centro, scan_h, scan_x0, scan_x1)
             Image.fromarray(crop).save(debug_dir / _DEBUG_FECHA_PAGO_ZONA)
         if scan_window:
             return self._result_desde_scan_window(scan_window)

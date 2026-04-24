@@ -17,6 +17,7 @@ from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
 from .fecha_extractor import (
+    Fecha,
     FechaResult,
     _agrupar_de_clusters,
     _BOILERPLATE_RE,
@@ -50,17 +51,18 @@ class FechaEmisionExtractor:
         h, w = cheque_img.shape[:2]
         scan_h = int(h * 0.55)
         scan_x0 = int(w * 0.10)
-        zona = cheque_img[0:scan_h, scan_x0:w]
+        scan_x1 = int(w * 0.80)
+        zona = cheque_img[0:scan_h, scan_x0:scan_x1]
         tokens_scan = self._ocr.read(zona)
         logger.info("Tokens scan: %s", [(t.text, round(t.cy, 3)) for t in tokens_scan])
 
         # 1. Ciudad-coma anchor
-        result = self._extraer_por_ciudad_coma(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        result = self._extraer_por_ciudad_coma(tokens_scan, cheque_img, scan_h, scan_x0, scan_x1, debug_dir)
         if result is not None:
             return result
 
         # 2. DE-cluster / EL-anchor
-        result = self._extraer_por_de_el(tokens_scan, cheque_img, scan_h, scan_x0, debug_dir)
+        result = self._extraer_por_de_el(tokens_scan, cheque_img, scan_h, scan_x0, scan_x1, debug_dir)
         if result is not None:
             return result
 
@@ -75,6 +77,7 @@ class FechaEmisionExtractor:
         cy_emision: float,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
     ) -> np.ndarray:
         ancla = next(
             (t for t in tokens_scan if abs(t.cy - cy_emision) < _VENTANA_CY and t.height > 0),
@@ -87,11 +90,11 @@ class FechaEmisionExtractor:
         offset_px = int(token_h_px * 0.5)
         y0 = max(0, centro_px - margen_px - offset_px)
         y1 = min(scan_h, centro_px + margen_px - offset_px)
-        return cheque_img[y0:y1, scan_x0:]
+        return cheque_img[y0:y1, scan_x0:scan_x1]
 
     @staticmethod
     def _result_desde_scan_window(scan_window: list[OCRResult]) -> FechaResult:
-        filtered, source_tokens = _filtrar_tokens_fecha_estructura(scan_window)
+        filtered, source_tokens, partial = _filtrar_tokens_fecha_estructura(scan_window)
         if len(filtered) == 1:
             iso = _fecha_completa_a_iso(filtered[0].text)
             if iso is not None:
@@ -101,7 +104,7 @@ class FechaEmisionExtractor:
                 "OCR incompleto, retornando tokens estructurales: %s",
                 [t.text for t in source_tokens],
             )
-            return FechaResult(fecha_iso=None, tokens=source_tokens)
+            return FechaResult(fecha_iso=None, tokens=source_tokens, partial=partial)
         logger.info("OCR incompleto, retornando tokens: %s", [t.text for t in scan_window])
         return FechaResult(fecha_iso=None, tokens=scan_window)
 
@@ -111,6 +114,7 @@ class FechaEmisionExtractor:
         cheque_img: np.ndarray,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
         debug_dir: Path | None,
     ) -> FechaResult | None:
         token = next(
@@ -131,7 +135,7 @@ class FechaEmisionExtractor:
             cy_emision, _VENTANA_CY, token.cx, [(t.text, round(t.cy, 3)) for t in scan_window],
         )
         if debug_dir is not None:
-            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
+            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0, scan_x1)
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
         if scan_window:
             return self._result_desde_scan_window(scan_window)
@@ -143,6 +147,7 @@ class FechaEmisionExtractor:
         cheque_img: np.ndarray,
         scan_h: int,
         scan_x0: int,
+        scan_x1: int,
         debug_dir: Path | None,
     ) -> FechaResult | None:
         el_token = self._encontrar_el(tokens_scan)
@@ -158,7 +163,7 @@ class FechaEmisionExtractor:
             cy_emision, _VENTANA_CY, [(t.text, round(t.cy, 3)) for t in scan_window],
         )
         if debug_dir is not None:
-            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0)
+            fecha_crop = self._get_debug_crop(cheque_img, tokens_scan, cy_emision, scan_h, scan_x0, scan_x1)
             Image.fromarray(fecha_crop).save(debug_dir / _DEBUG_FECHA_ZONA)
         if scan_window:
             return self._result_desde_scan_window(scan_window)
