@@ -219,9 +219,66 @@ def _buscar_anno_fallback(
     return None, "", ""
 
 
+def _filtrar_tokens_fecha_un_de(
+    tokens: list[OCRResult],
+    idx_de: int,
+) -> tuple[list[OCRResult], list[OCRResult], "PartialFecha | None"]:
+    """Parse a date line with only one DE (the year separator): [DIA] [MES...] DE [ANNO].
+
+    The first digit-containing token before DE is treated as the day; remaining
+    non-boilerplate tokens before DE are the month; first token after DE is the year.
+    """
+    before = [t for t in tokens[:idx_de] if not _BOILERPLATE_RE.match(t.text.strip())]
+    after = [t for t in tokens[idx_de + 1:] if not _BOILERPLATE_RE.match(t.text.strip())]
+
+    dia_token: OCRResult | None = None
+    mes_tokens: list[OCRResult] = []
+    for t in before:
+        if dia_token is None and re.search(r'\d', t.text):
+            dia_token = t
+        else:
+            mes_tokens.append(t)
+
+    anio_token: OCRResult | None = None
+    for t in after:
+        candidate = _limpiar_ano(t.text.strip())
+        if _ANNO_RE.match(candidate):
+            anio_token = t
+            break
+
+    dia_raw = dia_token.text.strip() if dia_token else ""
+    mes_raw = " ".join(t.text.strip() for t in mes_tokens)
+    anio_raw = anio_token.text.strip() if anio_token else ""
+
+    dia_text = _limpiar_dia(dia_raw)
+    mes_text = _limpiar_mes(mes_raw)
+    anio_text = _limpiar_ano(anio_raw)
+
+    fecha_completa = f"{dia_text} DE {mes_text} DE {anio_text}"
+    logger.info(
+        "Estructura fecha (1 DE): DIA=%r (limpio: %r), MES=%r (limpio: %r), ANNO=%r (limpio: %r) -> %r",
+        dia_raw, dia_text, mes_raw, mes_text, anio_raw, anio_text, fecha_completa,
+    )
+
+    source_tokens = [t for t in ([dia_token] + mes_tokens + [tokens[idx_de]] + ([anio_token] if anio_token else [])) if t is not None and t.text.strip()]
+
+    fecha = _validar_componentes(
+        dia_raw if dia_raw else None,
+        mes_raw if mes_raw else None,
+        anio_raw if anio_raw else None,
+    )
+
+    return (
+        [OCRResult(text=fecha_completa, confidence=1.0, cx=0.5, cy=0.5, height=0.1)],
+        source_tokens,
+        fecha,
+    )
+
+
 def _filtrar_tokens_fecha_estructura(
     tokens: list[OCRResult],
     skip_el_prefix: bool = False,
+    allow_single_de: bool = False,
 ) -> tuple[list[OCRResult], list[OCRResult], "PartialFecha | None"]:
     """Extrae DIA/MES/ANNO de los tokens.
 
@@ -229,14 +286,18 @@ def _filtrar_tokens_fecha_estructura(
         (combined, source_tokens, partial): combined is a single-element list with the
         assembled date string; source_tokens contains only the tokens that formed the
         structure; partial holds whichever components OCR did recognize (None = not found).
-        When fewer than 2 DE are found, returns (tokens, tokens, None).
+        When fewer than 2 DE are found and allow_single_de is False, returns (tokens, tokens, None).
 
     skip_el_prefix: pass True for fecha_pago lines that begin with 'EL'.
+    allow_single_de: pass True for fecha_emision, where the first DE (day-month separator)
+        may be absent. Format: [DIA] [MES...] DE [ANNO].
     """
     tokens = _expandir_tokens_de(tokens)
     de_indices = [i for i, t in enumerate(tokens) if _DE_RE.match(t.text.strip())]
 
     if len(de_indices) < 2:
+        if allow_single_de and len(de_indices) == 1:
+            return _filtrar_tokens_fecha_un_de(tokens, de_indices[0])
         logger.info("Estructura fecha: menos de 2 'DE' encontrados, retornando tokens originales")
         return tokens, tokens, None
 
