@@ -18,16 +18,18 @@ C:\Folders\UNGS\PPS\Proyecto\
 │   ├── extractors/
 │   │   ├── cheque_extractor.py     # Orquestador principal de extracción
 │   │   ├── monto_extractor.py      # Extracción del monto usando OCRReader
-│   │   └── fecha_emision_extractor.py # Extracción de fecha usando OCRReader
+│   │   ├── fecha_extractor.py      # Utilidades OCR compartidas para fechas
+│   │   ├── fecha_emision_extractor.py  # Extracción de fecha de emisión
+│   │   └── fecha_pago_extractor.py     # Extracción de fecha de pago
 │   ├── ocr/
-│   │   └── ocr_readers.py          # Abstracción de lectores OCR (docTR, Tesseract, etc.)
+│   │   └── ocr_readers.py          # Abstracción de lectores OCR (docTR, TrOCR, Surya, etc.)
 │   ├── llm/
 │   │   ├── llm_backends.py         # Backends HTTP para LLMs (Ollama, etc.)
 │   │   └── llm_validator.py        # Validación de campos con LLM
 │   └── pdf/
 │       └── pdf_processor.py       # Conversión PDF -> imágenes
 ├── output/     
-│   ├── cheques.json                # Datos extraidos
+│   ├── cheques.json                # Datos extraidos (array de runs)
 │   └── images/                     # Imagenes recortadas de cada cheque
 └── docs/     
     ├── implementacion.md           # Este documento
@@ -55,16 +57,24 @@ PDF de entrada
       |
       +---> [4a] Extraccion de monto (heuristica + OCR)
       |
-      +---> [4b] Extraccion de fecha (busqueda de tokens)
+      +---> [4b] Extraccion de fecha de emision (OCR + parsing estructural)
+      |
+      +---> [4c] Extraccion de fecha de pago (OCR + parsing estructural)
       |
       v
-[5] Validacion/refinamiento con LLM (opcional)
+[5] Validacion/refinamiento con LLM (opcional, paralelo)
+      |
+      +---> [5a] Inferencia de fecha_emision (si no se pudo parsear)
+      |
+      +---> [5b] Inferencia de fecha_pago (si no se pudo parsear)
+      |
+      +---> [5c] Extraccion de monto (solo si OCR no encontro nada)
       |
       v
 [6] Normalizacion y guardado en JSON
 ```
 
-**Nota:** Los pasos [4a], [4b] y [5] son coordinados por `ChequeExtractor`.
+**Nota:** Los pasos [4a], [4b] y [4c] son coordinados por `ChequeExtractor`. Las llamadas al LLM en [5] se ejecutan en paralelo con `ThreadPoolExecutor`.
 
 ## 4. Detalle de cada modulo
 
@@ -149,11 +159,13 @@ El monto detectado se convierte a `float` siguiendo las convenciones argentinas:
 - La coma es separador decimal: `802.470,20` se convierte a `802470.20`
 - Los numeros sin formato se toman tal cual: `4000000` se convierte a `4000000.0`
 
+Retorna: `MontoOCRResult { monto, monto_raw, monto_score, zona_tokens }` donde `zona_tokens` son los tokens OCR de la zona superior derecha, reutilizados opcionalmente por el LLM.
+
 ### 4.4 Abstraccion de lectores OCR (`ocr_readers.py`)
 
 **Proposito:** Desacoplar la logica de extraccion de campos de la libreria OCR concreta (docTR, Tesseract, EasyOCR, etc.).
 
-Define una interfaz comun `OCRReader` que permite intercambiar implementaciones sin modificar `MontoExtractor` o `FechaEmisionExtractor`.
+Define una interfaz comun `OCRReader` que permite intercambiar implementaciones sin modificar los extractores de campos.
 
 #### Interfaz base
 
@@ -174,26 +186,109 @@ Cada token detectado es un `OCRResult` con:
 - `text`: Palabra detectada.
 - `confidence`: Score de confianza (0.0-1.0).
 - `cx`, `cy`: Centro normalizado del token en la imagen (0-1).
+- `height`: Altura normalizada del token (0-1).
 
 #### Implementaciones disponibles
 
-1. **DocTRReader**: Usa docTR con arquitectura `db_resnet50 + crnn_vgg16_bn`. Implementacion por defecto, mas robusta.
-2. **TesseractReader**: Click alternativa con Tesseract (requiere binarios del sistema).
-3. **EasyOCRReader**: Opcion alternativa con EasyOCR.
+| Clase | Libreria | Flag CLI | Uso |
+|-------|---------|----------|-----|
+| `DocTRReader` | python-doctr (`db_resnet50` + `crnn_vgg16_bn`) | default | Motor principal |
+| `TrOCRReader` | transformers TrOCR (handwritten model) | `--trocr` | OCR alternativo para fecha (opcional) |
+| `SuryaReader` | surya-ocr | `--surya` | Reemplazo completo de DocTRReader |
+| `TesseractReader` | pytesseract | — | Disponible, no usado por defecto |
+| `EasyOCRReader` | easyocr | — | Disponible, no usado por defecto |
 
-### 4.5 Extraccion de fecha de emision (`fecha_emision_extractor.py`)
+### 4.5 Utilidades compartidas de fechas (`fecha_extractor.py`)
 
-**Proposito:** Extraer la linea de fecha "CIUDAD, DD DE MES DE AAAA" del cheque.
+**Proposito:** Centralizar estructuras de datos y logica de parsing OCR compartida entre `FechaEmisionExtractor` y `FechaPagoExtractor`.
 
-Utiliza un enfoque basado en tokens OCR mas que en procesamiento de imagen:
+#### Dataclasses principales
 
-1. **Escaneo de zona:** Lee tokens OCR de la franja superior-central del cheque (40-45% de alto), excluyendo el logo del banco (izq) y recuadro del monto (der).
-2. **Anclaje en "EL":** Busca el token "EL" (que siempre aparece en la linea siguente de la fecha: "EL DD DE MES DE AAAA" para pago). 
-3. **Filtrado:** Retorna solo los tokens entre el 30% inferior del header y la linea del "EL", que son los que constituyen la fecha de emision.
+**`Fecha`**: Componentes de una fecha con slots validados y raw:
+- `dia`, `mes`, `anno`: Valores limpios confirmados por OCR (`"15"`, `"03"`, `"2026"`) o `None`.
+- `dia_raw`, `mes_raw`, `anno_raw`: Texto OCR original para que el LLM pueda razonar sobre componentes no reconocidos.
+- `to_iso()`: Retorna `"YYYY-MM-DD"` si los tres componentes son conocidos.
+- `any_known()`, `all_known()`: Chequeos de completitud.
 
-El resultado es una lista de `OCRResult` que luego se envia al LLM para normalizacion a formato ISO.
+**`FechaResult`**: Resultado de un extractor de fecha:
+- `fecha_iso`: Fecha en formato ISO si se pudo parsear directamente, `None` si no.
+- `tokens`: Lista de `OCRResult` de la zona relevante, enviados al LLM cuando `fecha_iso` es `None`.
+- `partial`: `Fecha` con los componentes que el OCR si reconocio (para guiar al LLM).
 
-### 4.6 Backends de LLM (`llm_backends.py`)
+#### Funciones de parsing estructural
+
+- **`_filtrar_tokens_fecha_estructura(tokens)`**: Busca la estructura `DIA DE MES DE ANNO` en una lista de tokens OCR. Retorna `(combined, source_tokens, partial_fecha)`. Si la fecha esta completa y valida, `combined` tiene un unico token con la fecha formateada.
+- **`_fecha_completa_a_iso(text)`**: Convierte `"15 DE Marzo DE 2026"` a `"2026-03-15"`, o `None` si el formato es invalido.
+- **`_expandir_tokens_de(tokens)`**: Separa tokens fusionados con "DE" embebido (ej: `"16DE"` → `["16", "DE"]`).
+- **`_agrupar_de_clusters(de_tokens)`**: Agrupa tokens "DE" por proximidad vertical (umbral 0.06) para identificar lineas de fecha.
+
+#### Expresiones regulares clave
+
+- `_DE_RE`: Acepta tokens "DE" con posibles caracteres no alfanumericos alrededor.
+- `_EL_INICIO_RE`: Detecta "EL" incluso fusionado con el siguiente token (ej: `"EL19DE"`, `"ELZo"`).
+- `_BOILERPLATE_RE`: Identifica tokens del texto legal `"360 dias"` para excluirlos.
+- `_VENTANA_CY`: Umbral `0.07` para agrupar tokens en la misma fila normalizada.
+
+### 4.6 Extraccion de fecha de emision (`fecha_emision_extractor.py`)
+
+**Proposito:** Extraer la fecha de emision del cheque (formato "CIUDAD, DD DE MES DE AAAA").
+
+Retorna un `FechaResult` con la fecha ISO si se pudo parsear directamente, o los tokens relevantes para que el LLM infiera la fecha.
+
+#### Estrategia (en orden de prioridad)
+
+**Scan amplio inicial:** Se lee con OCR la zona `y: 0-55%, x: 10-80%` del cheque.
+
+**1. Ancla ciudad-coma:**
+- Busca un token que sea un nombre de ciudad terminado en coma (ej: `FEDERAL,`, `CUATIA,`, `QUILMES,`), con `cy > 0.30`.
+- Cuando se encuentra: `cy_emision` = `cy` del token, ventana = tokens a la derecha del token ciudad con `cy` similar.
+- Es el ancla mas confiable porque la ciudad siempre precede a la fecha en la misma linea.
+
+**2. Cluster DE / ancla EL:**
+- Si no hay ciudad-coma, busca pares de tokens "DE" en la misma fila (`cy` similar, umbral 0.06).
+- Descarta clusters cercanos a boilerplate (`360`, `dias`) o en la misma linea que el token "EL" (linea de pago).
+- Si no hay cluster DE valido, estima `cy_emision` como `1.5 × altura del token` por encima del token "EL".
+
+**3. Fallback:**
+- Toma todos los tokens del scan por encima del 40% del cheque (o del token "plazo" del texto legal, si aparece antes).
+- Dentro de esa zona, si hay tokens de mes o año conocidos, acota la ventana a su fila.
+
+#### Parseo directo vs. paso al LLM
+
+Una vez obtenida la ventana de tokens, se intenta parsear la estructura `DIA DE MES DE ANNO` directamente:
+- Si la fecha esta completa y valida (dia 1-31, mes conocido, año 2020-2030), se retorna `FechaResult(fecha_iso=..., tokens=...)`.
+- Si falta algun componente: se retorna `FechaResult(fecha_iso=None, tokens=source_tokens, partial=Fecha(...))` para que el LLM infiera los componentes faltantes.
+
+### 4.7 Extraccion de fecha de pago (`fecha_pago_extractor.py`)
+
+**Proposito:** Extraer la fecha de pago del cheque (linea que comienza con "EL DD DE MES DE AAAA").
+
+Complementa a `FechaEmisionExtractor`: mientras ese busca la linea de emision (mas arriba), este busca la linea de pago (mas abajo).
+
+#### Estrategia (en orden de prioridad)
+
+**Scan amplio inicial:** Se lee con OCR la zona `y: 0-55%, x: 10-70%` del cheque (zona izquierda, donde suele estar la fecha de pago).
+
+**1. Ancla EL:**
+- Busca tokens que comiencen con "EL" (incluso fusionado: `"EL19DE"`) con `cy > 0.35`.
+- Toma el token "EL" mas bajo (mayor `cy`) para evitar confundirlo con la linea de emision.
+- La ventana son los tokens en la misma fila (`±_VENTANA_CY`).
+
+**2. Ancla PAGUESE:**
+- Si no hay token "EL", busca el token `"Paguese"/"PAGUESE"` con `cy > 0.35`.
+- La fecha de pago esta una linea **por encima** de ese token: `cy_pago = cy_paguese - 1.5 × altura_token`.
+
+**3. Cluster DE inferior:**
+- Busca el cluster de tokens "DE" mas bajo (mayor `cy`) con al menos 2 tokens, descartando boilerplate.
+- Es el complemento del cluster que `FechaEmisionExtractor` descarto por estar en la linea de pago.
+
+**4. Fallback por keywords:**
+- Agrupa tokens de mes/año conocidos en bandas por `cy`.
+- Toma la banda mas baja (la fecha de pago es siempre mas abajo que la de emision).
+
+Al igual que `FechaEmisionExtractor`, intenta parsear directamente y, si no puede, retorna `FechaResult(fecha_iso=None, tokens=..., partial=Fecha(...))` para el LLM.
+
+### 4.8 Backends de LLM (`llm_backends.py`)
 
 **Proposito:** Proporcionar una interfaz comun para diferentes backends de LLM.
 
@@ -212,54 +307,65 @@ class LLMBackend(ABC):
 - Parametros: `model` (default: `"llama3.2"`), `base_url`, `timeout` (180s).
 - Retorna la respuesta del LLM o `None` si hay timeout/error.
 
-### 4.7 Validacion y extraccion con LLM (`llm_validator.py`)
+### 4.9 Validacion y extraccion con LLM (`llm_validator.py`)
 
 **Proposito:** Usar un LLM para validar, corregir y extraer campos estructurados a partir de tokens OCR.
 
-Este modulo es **opcional** y mejora la precision cuando se consume bastante tiempo extra.
+Este modulo es **opcional** y mejora la precision cuando el OCR estructural no puede parsear una fecha completa.
 
-#### Campos extraidos
+#### Metodos principales
 
-1. **monto**: Importe numerico en formato argentino (`"4.000.000"`, `"802.470,20"`).
-2. **fecha_emision**: Fecha en formato ISO (`"YYYY-MM-DD"`).
+**`extract_fields(ocr_tokens, batch_context)`**: Extrae monto y fecha_emision en un unico llamado al LLM. Usado cuando el monto no fue detectado por la heuristica OCR.
 
-#### Sistema de prompts
+**`infer_fecha(fecha_tokens, today_max, max_future_days, partial_fecha)`**: Especializado en inferir fechas a partir de tokens crudos con escritura imperfecta. Caracteristicas:
+- Acepta un `partial_fecha` (`Fecha`) con los componentes que el OCR ya confirmo; el LLM solo debe inferir los que faltan.
+- `today_max`: fecha maxima para `fecha_emision` (no puede ser futura).
+- `max_future_days`: dias maximos en el futuro para `fecha_pago` (tipicamente 365).
+- Incluye reglas de correccion OCR en el prompt: `Z↔2`, `o/O↔0`, `l↔1`, `S↔5`, confusiones de "I" con "1" en el dia, etc.
+- El LLM responde solo con `YYYY-MM-DD` o `null`.
+- Retorna `LLMExtractionResult` con confianza 0.88 si la fecha es valida.
+
+#### Sistema de prompts para fechas
 
 El LLM recibe:
-- **Prompt del sistema:** Instrucciones detalladas sobre como leer cheques argentinos, formatos, convenciones de confianza.
-- **Tokens OCR del cheque:** Texto de todos los tokens (monto + fecha) en orden de lectura.
-- **Contexto del lote:** Opcional - montos raw de otros cheques del mismo lote, para ayudar a desambiguar anomalias.
+- **Prompt del sistema:** Instrucciones sobre como ser un experto en fechas de cheques argentinos.
+- **Tokens OCR ordenados por posicion:** texto de los tokens de la linea de fecha.
+- **Restriccion de fecha:** `today_max` o `max_future_days` segun el campo.
+- **Hint parcial:** Si `partial_fecha` tiene componentes confirmados, el prompt indica cuales usar exactamente y cuales inferir.
 
-#### Scoring de confianza
+#### Overrides OCR sobre resultado LLM
 
-El LLM asigna un score de confianza (0.0-1.0) para cada campo:
-- **0.95-1.00:** Valor inequivoco, formato estandar reconocible.
-- **0.80-0.94:** Legible con algo de ruido OCR, reconstruccion segura.
-- **0.60-0.79:** Parcialmente reconstruido con contexto del lote.
-- **0.00-0.59:** El LLM esta adivinando, resultado no confiable.
+En `ChequeExtractor`, despues de recibir la fecha del LLM, se aplica `_apply_fecha_overrides`: los componentes que el OCR confirmo con certeza (dia, mes, o año) sobreescriben los del LLM para evitar drift del modelo.
 
 #### Estado de usar/no usar LLM
 
-`LLMValidator` es **opcional**. Si no se proporciona al `ChequeExtractor`, se usa solo la heuristica de OCR.
+`LLMValidator` es **opcional**. Si no se proporciona al `ChequeExtractor`:
+- Se usa solo el parseo directo OCR para las fechas.
+- `fecha_emision` y `fecha_pago` quedan en `None` si no se pudo parsear completamente.
+- `monto` usa solo la heuristica OCR.
 
-Si si se proporciona y el LLM devuelve una confianza >= 0.70, se usa su resultado. Sino, se preserva el resultado del OCR heuristico.
+Si se proporciona (`--con-llm`), se invoca cuando:
+- `fecha_emision` es `None` despues del parseo OCR.
+- `fecha_pago` es `None` despues del parseo OCR.
+- `monto` es `None` despues de la heuristica.
 
-### 4.8 Orquestador principal (`cheque_extractor.py`)
+### 4.10 Orquestador principal (`cheque_extractor.py`)
 
-**Proposito:** Coordinar `MontoExtractor`, `FechaEmisionExtractor` y `LLMValidator` para producir un `DatosCheque` completo.
+**Proposito:** Coordinar `MontoExtractor`, `FechaEmisionExtractor`, `FechaPagoExtractor` y `LLMValidator` para producir un `DatosCheque` completo.
 
 #### Flujo de `ChequeExtractor.extraer()`
 
-1. **OCR heuristico**: Extrae monto (heuristica + OCR) y tokens de fecha.
-2. **LLM opcional**: Si `LLMValidator` esta disponible, envia todos los tokens al LLM para refinamiento.
-3. **Decision de valores finales**:
-   - Si LLM confiance >= 0.70, usa resultado del LLM.
-   - Sino, preserva resultado del OCR heuristico.
-4. **Retorna**: `DatosCheque` con todos los campos + scores de confianza.
+1. **OCR secuencial:** Extrae monto, fecha_emision y fecha_pago via OCR heuristico.
+2. **LLM paralelo (opcional):** Si `LLMValidator` esta disponible, lanza hasta 3 llamadas LLM en paralelo con `ThreadPoolExecutor(max_workers=3)`:
+   - `infer_fecha` para `fecha_emision` (solo si `fecha_iso` es `None`).
+   - `infer_fecha` para `fecha_pago` (solo si `fecha_iso` es `None`).
+   - `extract_fields` para `monto` (solo si `monto` es `None`).
+3. **Overrides OCR:** Aplica `_apply_fecha_overrides` sobre el resultado LLM para fijar componentes que el OCR confirmo.
+4. **Retorna:** `DatosCheque` con todos los campos + scores de confianza.
 
-Esto permite un flujo hibrido: OCR rapido para velocidad, LLM opcional para precision.
+El paralelismo reduce la latencia total cuando se usan los tres campos con LLM.
 
-### 4.9 Modelo de datos y persistencia (`models.py`)
+### 4.11 Modelo de datos y persistencia (`models.py`)
 
 Se define un `dataclass` llamado `DatosCheque` con los siguientes campos:
 
@@ -269,37 +375,48 @@ Se define un `dataclass` llamado `DatosCheque` con los siguientes campos:
 | `monto_raw` | `str` | Texto crudo tal como lo leyo el OCR/LLM |
 | `monto_score` | `float` | Puntaje de confianza de la deteccion heuristica |
 | `monto_llm_confidence` | `float` o `None` | Score de confianza del LLM (0.0-1.0) si disponible |
-| `fecha_emision` | `str` o `None` | Fecha de emision en formato ISO (`YYYY-MM-DD`) si se extrajo |
-| `fecha_emision_raw` | `str` o `None` | Texto crudo de la fecha segun el LLM |
-| `fecha_emision_llm_confidence` | `float` o `None` | Score de confianza del LLM para la fecha |
+| `fecha_emision` | `str` o `None` | Fecha de emision en formato ISO (`YYYY-MM-DD`) |
+| `fecha_emision_raw` | `str` o `None` | Mismo valor que `fecha_emision` (ISO directo) |
+| `fecha_emision_llm_confidence` | `float` o `None` | Score de confianza del LLM para la fecha de emision |
+| `fecha_pago` | `str` o `None` | Fecha de pago en formato ISO (`YYYY-MM-DD`) |
+| `fecha_pago_raw` | `str` o `None` | Mismo valor que `fecha_pago` (ISO directo) |
+| `fecha_pago_llm_confidence` | `float` o `None` | Score de confianza del LLM para la fecha de pago |
 | `imagen_path` | `str` | Ruta a la imagen recortada del cheque |
 | `pdf_origen` | `str` | Nombre del archivo PDF de origen |
 | `pagina` | `int` | Numero de pagina dentro del PDF |
 | `indice_en_pagina` | `int` | Indice del cheque dentro de la pagina |
 
-Los datos se persisten en un archivo JSON con la estructura:
+Los datos se persisten en `cheques.json` como un **array de runs**, donde cada run corresponde a una ejecucion del programa:
 ```json
-{
-  "total_cheques": 12,
-  "cheques": [
-    {
-      "monto": 2500000.0,
-      "monto_raw": "2.500.000",
-      "monto_score": 5.35,
-      "monto_llm_confidence": 0.98,
-      "fecha_emision": "2026-02-15",
-      "fecha_emision_raw": "15 DE Febrero DE 2026",
-      "fecha_emision_llm_confidence": 0.95,
-      "imagen_path": "output\\images\\Scan CH1_p1_ch1.png",
-      "pdf_origen": "Scan CH1.pdf",
-      "pagina": 1,
-      "indice_en_pagina": 1
-    }
-  ]
-}
+[
+  {
+    "fecha_proceso": "2026-04-24T10:00:00",
+    "nombre_archivo": "Scan CH1.pdf",
+    "cheques": [
+      {
+        "monto": 2500000.0,
+        "monto_raw": "2.500.000",
+        "monto_score": 5.35,
+        "monto_llm_confidence": null,
+        "fecha_emision": "2026-02-15",
+        "fecha_emision_raw": "2026-02-15",
+        "fecha_emision_llm_confidence": 0.88,
+        "fecha_pago": "2026-08-15",
+        "fecha_pago_raw": "2026-08-15",
+        "fecha_pago_llm_confidence": 0.88,
+        "imagen_path": "output\\images\\Scan CH1_p1_ch1.png",
+        "pdf_origen": "Scan CH1.pdf",
+        "pagina": 1,
+        "indice_en_pagina": 1
+      }
+    ]
+  }
+]
 ```
 
-### 4.10 Interfaz de linea de comandos (`main.py`)
+Cada nueva ejecucion **agrega** su run al array existente (no sobreescribe).
+
+### 4.12 Interfaz de linea de comandos (`main.py`)
 
 El programa ofrece tres comandos:
 
@@ -310,12 +427,33 @@ python main.py procesar "ruta/al/archivo.pdf"
 # Procesar todos los PDFs de un directorio
 python main.py procesar "ruta/al/directorio/"
 
+# Activar LLM de texto para campos no parseados
+python main.py procesar "ruta/al/archivo.pdf" --con-llm
+
+# Usar TrOCR para la zona de fecha
+python main.py procesar "ruta/al/archivo.pdf" --trocr
+
+# Usar Surya como motor OCR principal
+python main.py procesar "ruta/al/archivo.pdf" --surya
+
 # Listar cheques procesados
 python main.py listar
 
 # Buscar en los cheques procesados
 python main.py buscar "termino"
 ```
+
+**Flags de `procesar`:**
+
+| Flag | Efecto |
+|------|--------|
+| `--con-llm` | Activa LLM de texto (Ollama) para inferir fechas y monto cuando OCR falla |
+| `--llm-model` | Modelo Ollama para LLM de texto (default: `llama3.2`) |
+| `--llm-url` | URL del servidor Ollama (default: `http://localhost:11434`) |
+| `--trocr` | Usa TrOCR (handwritten) como OCR alternativo |
+| `--surya` | Usa Surya como motor OCR principal en lugar de docTR |
+| `--debug` | Activa logging DEBUG y guarda imagenes intermedias en `output/debug/` |
+| `--vision-llm` | Flag existente en el CLI pero actualmente sin efecto (implementacion deshabilitada) |
 
 ## 5. Dependencias
 
@@ -343,9 +481,10 @@ Sobre los 12 cheques de prueba (4 PDFs, 3 cheques por pagina, 6 bancos distintos
 - **Extraccion de monto parcial** (orden de magnitud correcto): 10/12 (83%)
 - Los 8 aciertos exactos tienen un score de confianza >= 1.3, lo cual permite al usuario filtrar resultados confiables.
 
-**Extraccion de fecha de emision (con LLM):**
-- Extraccion exitosa con Ollama + llama3.2 en todos los cheques validados.
-- Scores de confianza tipicos: 0.85-0.99 (muy alta precision).
+**Extraccion de fechas (con LLM):**
+- Extraccion exitosa de `fecha_emision` y `fecha_pago` con Ollama + llama3.2 en todos los cheques validados.
+- El OCR estructural puede parsear directamente las fechas cuando la escritura es clara.
+- Cuando el OCR no puede parsear completamente, el LLM recibe los componentes parciales confirmados y solo infiere los faltantes.
 
 ## 7. Limitaciones conocidas
 
@@ -354,10 +493,14 @@ Sobre los 12 cheques de prueba (4 PDFs, 3 cheques por pagina, 6 bancos distintos
 2. **Montos sin formato de puntos de miles:** Montos chicos como `$4.215` que no llevan puntos de miles son mas dificiles de distinguir de otros numeros en el cheque.
 3. **Decimales separados:** Cuando el OCR detecta los centavos como un texto separado del monto entero, no siempre se concatenan correctamente (ej: `802.470` sin los `,20`).
 
-**LLM (fecha, validacion):**
-4. **Dependencia externa:** La extraccion de fecha requiere un servidor LLM externo (ej. Ollama). Sin LLM, solo se extraen montos.
-5. **Latencia:** Usar LLM agrega muchisimo tiempo: ~20-30 segundos por cheque en CPU (vs ~4-6 seg con OCR puro). Se recomienda usar LLM solo cuando la precision sea critica.
-6. **Modelos variables:** La calidad depends del modelo LLM utilizado. Modelos mas pequenos pueden tener precision baja.
+**OCR estructural (fechas):**
+4. **Tokens fusionados:** El OCR a veces funde tokens adyacentes (ej: `"16DE"`, `"EL19DE"`). La funcion `_expandir_tokens_de` maneja los casos mas comunes, pero combinaciones inusuales pueden fallar.
+5. **Anclas no detectadas:** Si el scan amplio no detecta ninguna de las anclas (ciudad-coma, DE-cluster, EL), el fallback devuelve tokens genericos que el LLM debe interpretar.
+
+**LLM (fecha, monto):**
+6. **Dependencia externa:** El LLM requiere un servidor Ollama corriendo localmente. Sin LLM, las fechas quedan en `None` si el parseo directo no funciona.
+7. **Latencia:** Usar LLM agrega tiempo: ~10-30 segundos por cheque en CPU segun el modelo. Con paralelizacion de las 3 llamadas, el tiempo total es el de la llamada mas lenta.
+8. **Modelos variables:** La calidad depende del modelo LLM utilizado. Modelos mas pequenos pueden tener precision baja en fechas con escritura muy deteriorada.
 
 **General:**
-7. **Velocidad sin GPU:** El procesamiento OCR toma aproximadamente 4-6 segundos por cheque en CPU (sin GPU).
+9. **Velocidad sin GPU:** El procesamiento OCR toma aproximadamente 4-6 segundos por cheque en CPU (sin GPU).

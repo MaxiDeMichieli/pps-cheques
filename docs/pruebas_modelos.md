@@ -93,7 +93,7 @@ Se utilizaron **12 cheques** provenientes de 4 archivos PDF escaneados a 300 DPI
 - Captura algunos patrones numericos de forma parcial: en el cheque 12 leyo `lb.200,000` (cercano a `6.200.000`) y en el cheque 1 leyo `2.000.000` (cercano a `2.500.000`)
 - La binarizacion no mejora los resultados; en algunos casos los empeora
 
-**Conclusion:** Descartado. Para ser util requeriria fine-tuning con un dataset de caligrafia en español y numeros, lo cual esta fuera del alcance del proyecto.
+**Conclusion:** Descartado como motor principal para el monto. Sin embargo, posteriormente se integro como `TrOCRReader` en la abstraccion `OCRReader`, disponible con el flag `--trocr` como motor OCR alternativo para el scan de fechas. No se aplica sobre el monto.
 
 ---
 
@@ -212,9 +212,10 @@ Ademas de los modelos OCR, se probaron distintas estrategias para recortar la zo
 | Motor OCR | Aciertos exactos | Manuscrito | Impreso | Estado |
 |-----------|-----------------|------------|---------|--------|
 | EasyOCR 1.7.2 | 1/12 (8%) | Muy pobre | Bueno | Descartado |
-| TrOCR base | 0/12 (0%) | Solo ingles | N/A | Descartado |
+| TrOCR base | 0/12 (0%) | Solo ingles | N/A | Disponible via `--trocr` (fechas) |
 | PaddleOCR 3.4 | N/A | N/A | N/A | Error de compatibilidad |
-| **docTR 1.0.1** | **8/12 (67%)** | **Aceptable** | **Bueno** | **Seleccionado** |
+| **docTR 1.0.1** | **8/12 (67%)** | **Aceptable** | **Bueno** | **Seleccionado (default)** |
+| Surya | No evaluado | — | — | Disponible via `--surya` |
 
 ## 6. Variantes de preprocesamiento comparadas
 
