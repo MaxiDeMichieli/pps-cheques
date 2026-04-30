@@ -26,6 +26,10 @@ class DatosCheque:
     fecha_pago_raw: str | None = None
     fecha_pago_llm_confidence: float | None = None
 
+    # Librador
+    cuit_librador: str | None = None
+    nombre_librador: str | None = None
+
     # Metadata
     imagen_path: str = ""
     pdf_origen: str = ""
