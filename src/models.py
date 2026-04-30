@@ -26,6 +26,10 @@ class DatosCheque:
     fecha_pago_raw: str | None = None
     fecha_pago_llm_confidence: float | None = None
 
+    sucursal: str | None = None
+    sucursal_raw: str | None = None
+    sucursal_score: float = 0.0
+
     # Metadata
     imagen_path: str = ""
     pdf_origen: str = ""

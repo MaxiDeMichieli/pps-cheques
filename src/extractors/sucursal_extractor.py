@@ -2,7 +2,7 @@
 
 Usa un lector OCR abstracto para leer el código de sucursal.
 Estrategia simple:
-1. Buscar las anclas "SUC" o "SUCURSAL" con OCR en la zona del 20% superior
+1. Buscar las anclas "SUC", "SUCURSAL" o "FILIAL" con OCR en la zona del 40% inferior
 2. Recortar alrededor de la ancla y leer con OCR (crudo, otsu, x2)
 3. Extraer el valor numerico despues de la ancla
 4. Elegir el candidato con mejor formato
@@ -20,6 +20,9 @@ from pathlib import Path
 from PIL import Image
 
 from ..ocr.ocr_readers import OCRReader, OCRResult
+
+
+_DEBUG_SUCURSAL_ZONA = "sucursal_zona.png"
 
 
 @dataclass
@@ -54,13 +57,16 @@ class SucursalExtractor:
             if debug_dir is not None:
                 Image.fromarray(img).save(debug_dir / name)
 
-        # ---- Paso 1: Zona del 20% superior para buscar ancla SUC/SUCURSAL ----
-        zona_sucursal = cheque_img[0:int(h * 0.20), :]
+        # ---- Paso 1: Zona del 40% inferior para buscar ancla SUC/SUCURSAL/FILIAL ----
+        zona_sucursal = cheque_img[int(h * 0.60):h, :]
+        if debug_dir is not None:
+            Image.fromarray(zona_sucursal).save(debug_dir / _DEBUG_SUCURSAL_ZONA)
         _save(zona_sucursal, "sucursal_zona_completa.png")
         zona_tokens = self._ocr.read(zona_sucursal)
         textos = [(r.text, r.confidence, r.cx, r.cy) for r in zona_tokens]
 
         ancla_pos = self._encontrar_ancla(textos)
+        candidatos_ancla = []
 
         if ancla_pos:
             cx, cy = ancla_pos
@@ -68,14 +74,18 @@ class SucursalExtractor:
             x_abs = int(cx * zw)
             y_abs = int(cy * zh)
 
-            margen_y = int(zh * 0.30)
-            margen_x_der = int(zw * 0.30)
+            offset_x = int(zw * 0.01) # pequeño margen para recortar parte del ancla: "SUC" o "SUCURSAL"
+            x0 = min(zw, x_abs + offset_x)
+            margen_y = int(zh * 0.05)
+            margen_x_der = int(zw * 0.40)  # recortar hasta 40% del ancho a la derecha de la ancla, buscando el nombre de ciudad
             crop = zona_sucursal[
                 max(0, y_abs - margen_y):min(zh, y_abs + margen_y),
-                min(zw, x_abs):min(zw, x_abs + margen_x_der),
+                x0:min(zw, x0 + margen_x_der),
             ]
 
             if crop.size > 0:
+                if debug_dir is not None:
+                    Image.fromarray(crop).save(debug_dir / "sucursal_crop.png")
                 for prep_fn, label in [
                     (self._noop, "sucursal_ancla_crop_raw.png"),
                     (self._otsu, "sucursal_ancla_crop_otsu.png"),
@@ -84,25 +94,44 @@ class SucursalExtractor:
                     img = prep_fn(crop)
                     _save(img, label)
                     for txt in self._extraer_sucursales(self._ocr_read(img), cerca_ancla=True):
-                        candidatos.append((txt, True))
+                        candidatos_ancla.append(txt)
 
         # ---- Paso 2: Zonas fijas (siempre, complementa el paso 1) ----
+        candidatos_fijos = []
         for i, (x_inicio, x_fin) in enumerate([(0.35, 0.65), (0.30, 0.70), (0.20, 0.80)], 1):
-            zona = cheque_img[0:int(h * 0.20), int(w * x_inicio):int(w * x_fin)]
+            zona = cheque_img[int(h * 0.60):h, int(w * x_inicio):int(w * x_fin)]
             _save(zona, f"sucursal_fixed_z{i}.png")
-            for prep_fn in [self._noop, self._otsu]:
+            for prep_fn, label in [
+                (self._noop, f"sucursal_fixed_z{i}_raw.png"),
+                (self._otsu, f"sucursal_fixed_z{i}_otsu.png"),
+            ]:
                 img = prep_fn(zona)
+                _save(img, label)
                 for txt in self._extraer_sucursales(self._ocr_read(img), cerca_ancla=False):
-                    candidatos.append((txt, False))
-            if any(self._score(t, d) >= 3.0 for t, d in candidatos):
+                    candidatos_fijos.append(txt)
+            if any(self._score(t, False) >= 3.0 for t in candidatos_fijos):
                 break
 
         # ---- Elegir mejor candidato ----
-        if candidatos:
-            candidatos.sort(key=lambda c: self._score(c[0], c[1]), reverse=True)
-            mejor_txt, mejor_ancla = candidatos[0]
-            ocr_score = self._score(mejor_txt, mejor_ancla)
-            ocr_valor = self._normalizar(mejor_txt)
+        # Priorizar candidatos de la ancla si tienen score decente (>= 3.0)
+        if candidatos_ancla:
+            candidatos_ancla.sort(key=lambda t: self._score(t, True), reverse=True)
+            mejor_ancla = candidatos_ancla[0]
+            score_ancla = self._score(mejor_ancla, True)
+            if score_ancla >= 3.0:
+                mejor_txt, ocr_score, ocr_valor = mejor_ancla, score_ancla, self._normalizar(mejor_ancla)
+            else:
+                # Usar fijos si ancla no es buena
+                if candidatos_fijos:
+                    candidatos_fijos.sort(key=lambda t: self._score(t, False), reverse=True)
+                    mejor_fijo = candidatos_fijos[0]
+                    mejor_txt, ocr_score, ocr_valor = mejor_fijo, self._score(mejor_fijo, False), self._normalizar(mejor_fijo)
+                else:
+                    mejor_txt, ocr_score, ocr_valor = mejor_ancla, score_ancla, self._normalizar(mejor_ancla)
+        elif candidatos_fijos:
+            candidatos_fijos.sort(key=lambda t: self._score(t, False), reverse=True)
+            mejor_fijo = candidatos_fijos[0]
+            mejor_txt, ocr_score, ocr_valor = mejor_fijo, self._score(mejor_fijo, False), self._normalizar(mejor_fijo)
         else:
             mejor_txt, ocr_score, ocr_valor = "", -1, None
 
@@ -121,9 +150,9 @@ class SucursalExtractor:
 
     @staticmethod
     def _encontrar_ancla(textos):
-        """Busca 'SUC' o 'SUCURSAL' en los textos OCR."""
+        """Busca 'SUC', 'SUCURSAL' o 'FILIAL' en los textos OCR."""
         for txt, conf, cx, cy in textos:
-            if re.search(r'\bsuc(ursal)?\b', txt, re.IGNORECASE):
+            if re.search(r'\b(suc(ursal)?|filial)\b', txt, re.IGNORECASE):
                 return cx, cy
         return None
 
@@ -155,7 +184,7 @@ class SucursalExtractor:
 
         # Encontrar posicion de la ancla
         for txt, conf, cx, cy in textos:
-            if re.search(r'\bsuc(ursal)?\b', txt, re.IGNORECASE):
+            if re.search(r'\b(suc(ursal)?|filial)\b', txt, re.IGNORECASE):
                 ancla_cx = cx
                 break
 
