@@ -149,7 +149,7 @@ class SucursalExtractor:
     # ---- Extraccion de candidatos ----
 
     def _extraer_sucursales(self, textos, cerca_ancla=False):
-        """Extrae candidatos a sucursal de textos OCR."""
+        """Extrae candidatos a sucursal (nombres de ciudades) de textos OCR."""
         candidatos = []
         ancla_cx = None
 
@@ -159,7 +159,7 @@ class SucursalExtractor:
                 ancla_cx = cx
                 break
 
-        # Buscar numeros despues de la ancla
+        # Buscar nombres de ciudades despues de la ancla
         for txt, conf, cx, cy in textos:
             if ancla_cx is not None and cx <= ancla_cx:
                 continue
@@ -168,15 +168,14 @@ class SucursalExtractor:
             if not limpio:
                 continue
 
-            # Numeros puros (codigo de sucursal tipicamente 3-5 digitos)
-            if re.match(r'^\d{1,5}$', limpio):
-                candidatos.append(limpio)
+            # Descartar si es principalmente numerico
+            digitos = re.sub(r'[^0-9]', '', limpio)
+            if len(digitos) >= len(limpio) * 0.7:  # Mas de 70% digitos
                 continue
 
-            # Extraer numero al inicio
-            m = re.match(r'^(\d{1,5})', limpio)
-            if m:
-                candidatos.append(m.group(1))
+            # Nombre de ciudad: al menos 3 letras, puede tener espacios/guiones
+            if re.search(r'[a-zA-Z]', limpio) and len(limpio) >= 3:
+                candidatos.append(limpio)
 
         return candidatos
 
@@ -187,16 +186,21 @@ class SucursalExtractor:
         if not txt:
             return -1
 
-        digitos = re.sub(r'[^0-9]', '', txt)
-        score = len(digitos) * 0.5
+        # Favor palabras más largas (típicamente nombres de ciudades)
+        letras = re.sub(r'[^a-zA-Z]', '', txt)
+        score = len(letras) * 0.3
 
-        # Numero de 3-5 digitos = formato tipico de sucursal
-        if re.match(r'^\d{3,5}$', txt):
-            score += 3.0
-        elif re.match(r'^\d{1,2}$', txt):
-            score -= 1.0  # Muy pocos digitos
-        elif len(digitos) > 5:
-            score -= 2.0  # Demasiados digitos
+        # Nombre de ciudad bien formado: 5+ letras
+        if len(letras) >= 5:
+            score += 2.0
+        elif len(letras) >= 3:
+            score += 0.5
+        else:
+            score -= 1.0  # Muy corto
+
+        # Bonus si tiene mayuscula inicial (formato tipico de ciudad)
+        if txt[0].isupper():
+            score += 1.0
 
         # Bonus si esta cerca de la ancla
         if cerca_ancla:
@@ -210,18 +214,20 @@ class SucursalExtractor:
     def _normalizar(txt):
         """Convierte sucursal a string limpio.
 
-        Extrae solo los digitos, valida longitud tipica (3-5 caracteres).
+        Extrae el nombre de ciudad, elimina espacios/caracteres especiales innecesarios.
         """
         if not txt:
             return None
 
-        limpio = re.sub(r'[^0-9]', '', txt).strip()
+        limpio = txt.strip()
 
-        if not limpio or len(limpio) == 0:
+        # Descartar si no tiene letras
+        if not re.search(r'[a-zA-Z]', limpio):
             return None
 
-        # Sucursal tipicamente 3-5 digitos
-        if 1 <= len(limpio) <= 5:
+        # Sucursal es un nombre de ciudad (al menos 3 letras)
+        letras = re.sub(r'[^a-zA-Z]', '', limpio)
+        if len(letras) >= 3:
             return limpio
 
         return None
