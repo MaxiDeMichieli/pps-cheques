@@ -26,6 +26,7 @@ class DatosCheque:
     fecha_pago_raw: str | None = None
     fecha_pago_llm_confidence: float | None = None
 
+    # Sucursal
     sucursal: str | None = None
     sucursal_raw: str | None = None
     sucursal_score: float = 0.0
@@ -34,6 +35,10 @@ class DatosCheque:
     numero_sucursal: str | None = None
     numero_cheque: str | None = None
     numero_cuenta: str | None = None
+
+    # Librador
+    cuit_librador: str | None = None
+    nombre_librador: str | None = None
 
     # Metadata
     imagen_path: str = ""
