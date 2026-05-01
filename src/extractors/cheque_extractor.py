@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .campos_librador_extractor import CamposLibradorExtractor
 from .fecha_emision_extractor import FechaEmisionExtractor
 from .fecha_pago_extractor import FechaPagoExtractor
 from ..models import DatosCheque
@@ -39,6 +40,7 @@ class ChequeExtractor:
         self._fecha_ext = FechaEmisionExtractor(ocr_reader)
         self._fecha_pago_ext = FechaPagoExtractor(ocr_reader)
         self._sucursal_ext = SucursalExtractor(ocr_reader)
+        self._librador_ext = CamposLibradorExtractor(ocr_reader)
         self._llm = llm_validator
 
     def extraer(
@@ -59,10 +61,13 @@ class ChequeExtractor:
         fecha_result = self._fecha_ext.extraer(cheque_img, debug_dir=debug_dir)
         fecha_pago_result = self._fecha_pago_ext.extraer(cheque_img, debug_dir=debug_dir)
         sucursal_result = self._sucursal_ext.extraer(cheque_img, debug_dir=debug_dir)
+        librador_result = self._librador_ext.extraer(cheque_img, debug_dir=debug_dir)
         logger.info(
-            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_pago_iso=%r, fecha_tokens=%d, sucursal=%r): %.1fs",
+            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_pago_iso=%r, fecha_tokens=%d, sucursal=%r, cuit=%r, nombre=%r): %.1fs",
             len(monto_result.zona_tokens), fecha_result.fecha_iso,
-            fecha_pago_result.fecha_iso, len(fecha_result.tokens), sucursal_result.sucursal,
+            fecha_pago_result.fecha_iso, len(fecha_result.tokens),
+            sucursal_result.sucursal,
+            librador_result.cuit, librador_result.nombre,
             time.perf_counter() - t0,
         )
 
@@ -73,6 +78,8 @@ class ChequeExtractor:
         monto_raw = monto_result.monto_raw
         fecha_emision = fecha_result.fecha_iso
         fecha_pago = fecha_pago_result.fecha_iso
+        cuit_librador = librador_result.cuit
+        nombre_librador = librador_result.nombre
         monto_llm_confidence = None
         fecha_llm_confidence = None
         fecha_pago_llm_confidence = None
@@ -139,6 +146,8 @@ class ChequeExtractor:
             sucursal=sucursal,
             sucursal_raw=sucursal_raw,
             sucursal_score=sucursal_score,
+            cuit_librador=cuit_librador,
+            nombre_librador=nombre_librador,
         )
 
     @staticmethod
