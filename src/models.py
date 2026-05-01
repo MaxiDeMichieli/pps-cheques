@@ -30,6 +30,11 @@ class DatosCheque:
     sucursal_raw: str | None = None
     sucursal_score: float = 0.0
 
+    # Identificadores del recuadro derecho (OCR puro, sin LLM)
+    numero_sucursal: str | None = None
+    numero_cheque: str | None = None
+    numero_cuenta: str | None = None
+
     # Metadata
     imagen_path: str = ""
     pdf_origen: str = ""

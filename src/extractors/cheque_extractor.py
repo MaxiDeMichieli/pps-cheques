@@ -15,6 +15,7 @@ import numpy as np
 
 from .fecha_emision_extractor import FechaEmisionExtractor
 from .fecha_pago_extractor import FechaPagoExtractor
+from .identificadores_extractor import IdentificadoresExtractor
 from ..models import DatosCheque
 from .fecha_extractor import Fecha
 from .monto_extractor import MontoExtractor
@@ -39,6 +40,7 @@ class ChequeExtractor:
         self._fecha_ext = FechaEmisionExtractor(ocr_reader)
         self._fecha_pago_ext = FechaPagoExtractor(ocr_reader)
         self._sucursal_ext = SucursalExtractor(ocr_reader)
+        self._identificadores_ext = IdentificadoresExtractor(ocr_reader)
         self._llm = llm_validator
 
     def extraer(
@@ -59,10 +61,14 @@ class ChequeExtractor:
         fecha_result = self._fecha_ext.extraer(cheque_img, debug_dir=debug_dir)
         fecha_pago_result = self._fecha_pago_ext.extraer(cheque_img, debug_dir=debug_dir)
         sucursal_result = self._sucursal_ext.extraer(cheque_img, debug_dir=debug_dir)
+        identificadores_result = self._identificadores_ext.extraer(cheque_img, debug_dir=debug_dir)
         logger.info(
-            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_pago_iso=%r, fecha_tokens=%d, sucursal=%r): %.1fs",
+            "OCR zonas (monto=%d tokens, fecha_iso=%r, fecha_pago_iso=%r, fecha_tokens=%d, "
+            "sucursal=%r, num_suc=%r, num_cheque=%r, num_cta=%r): %.1fs",
             len(monto_result.zona_tokens), fecha_result.fecha_iso,
             fecha_pago_result.fecha_iso, len(fecha_result.tokens), sucursal_result.sucursal,
+            identificadores_result.sucursal, identificadores_result.numero_cheque,
+            identificadores_result.cuenta,
             time.perf_counter() - t0,
         )
 
@@ -139,6 +145,9 @@ class ChequeExtractor:
             sucursal=sucursal,
             sucursal_raw=sucursal_raw,
             sucursal_score=sucursal_score,
+            numero_sucursal=identificadores_result.sucursal,
+            numero_cheque=identificadores_result.numero_cheque,
+            numero_cuenta=identificadores_result.cuenta,
         )
 
     @staticmethod
