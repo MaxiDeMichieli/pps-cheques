@@ -25,6 +25,7 @@ _BOILERPLATE_RE = re.compile(r'^(360|dias?)$', re.IGNORECASE)
 _PLAZO_360_RE = re.compile(r'^plazo$', re.IGNORECASE)
 
 _ANNO_RE = re.compile(r'^20\d{2}$')
+_FOUR_DIGITS_RE = re.compile(r'\d{4}')
 
 _VENTANA_CY = 0.07
 
@@ -36,6 +37,47 @@ _MES_A_NUM = {
 
 _DE_EMBEDDED_SPLIT_RE = re.compile(r'(DE)', re.IGNORECASE)
 _EL_STRIP_RE = re.compile(r'^[Ee][Ll]')
+
+# OCR character confusion rules: (ocr_char, true_char, field_context)
+# day/year: letters/symbols that OCR reads instead of digits (forward substitution)
+# month: digits that OCR reads instead of letters (inverse substitution)
+_OCR_CHAR_RULES: list[tuple[str, str, str]] = [
+    # Day
+    ('Z', '2', 'day'), ('z', '2', 'day'),
+    ('S', '5', 'day'), ('s', '5', 'day'),
+    ('O', '0', 'day'), ('o', '0', 'day'),
+    ('I', '1', 'day'), ('i', '1', 'day'),
+    ('/', '1', 'day'),
+    # Year
+    ('Z', '2', 'year'), ('z', '2', 'year'),
+    ('O', '0', 'year'), ('o', '0', 'year'),
+    ('7', '2', 'year'),
+    # Month (inverse: digit → letter look-alike)
+    ('0', 'o', 'month'), ('1', 'i', 'month'),
+    ('2', 'z', 'month'), ('3', 'e', 'month'),
+]
+
+_DAY_OCR_SUBS  = str.maketrans({c: t for c, t, ctx in _OCR_CHAR_RULES if ctx == 'day'})
+_YEAR_OCR_SUBS = str.maketrans({c: t for c, t, ctx in _OCR_CHAR_RULES if ctx == 'year'})
+_MES_OCR_SUBS  = str.maketrans({c: t for c, t, ctx in _OCR_CHAR_RULES if ctx == 'month'})
+
+
+def _trigrams(text: str) -> set[str]:
+    return {text[i:i + 3] for i in range(len(text) - 2)}
+
+
+_MES_TRIGRAMS: dict[str, set[str]] = {mes: _trigrams(mes) for mes in _MESES_NOMBRES}
+
+
+def _mes_por_trigrams(alpha_only: str) -> str | None:
+    token_tgrams = _trigrams(alpha_only)
+    scores = {m: len(token_tgrams & tgrams) for m, tgrams in _MES_TRIGRAMS.items()}
+    best = max(scores.values())
+    if best >= 2:
+        winners = [m for m, s in scores.items() if s == best]
+        if len(winners) == 1:
+            return winners[0].capitalize()
+    return None
 
 
 @dataclass
@@ -85,11 +127,11 @@ def _validar_componentes(
     Only accepts values the code can confirm with certainty:
       - day: numeric 1-31
       - month: recognized Spanish month name
-      - year: exactly 20XX in range 2020-2030 (e.g. "2076" stays None → LLM fixes it)
+      - year: exactly 20XX in range 2020-2030 (e.g. "7076" normalized to "2076" → valid)
     """
     dia = None
     if dia_raw:
-        for d in re.findall(r'\d+', dia_raw):
+        for d in re.findall(r'\d+', _limpiar_dia(dia_raw)):
             n = int(d)
             if 1 <= n <= 31:
                 dia = str(n).zfill(2)
@@ -104,7 +146,7 @@ def _validar_componentes(
 
     anno = None
     if anno_raw:
-        for y_str in re.findall(r'\d{4}', anno_raw):
+        for y_str in _FOUR_DIGITS_RE.findall(anno_raw):
             if 2020 <= int(y_str) <= 2030:
                 anno = y_str
                 break
@@ -133,7 +175,8 @@ def _fecha_completa_a_iso(text: str) -> str | None:
 
 
 def _limpiar_dia(text: str) -> str:
-    for d in re.findall(r'\d+', text):
+    normalized = text.translate(_DAY_OCR_SUBS)
+    for d in re.findall(r'\d+', normalized):
         num = int(d)
         if 1 <= num <= 31:
             return str(num).zfill(2)
@@ -141,17 +184,39 @@ def _limpiar_dia(text: str) -> str:
 
 
 def _limpiar_mes(text: str) -> str:
-    text_lower = text.lower().strip()
+    text_lower = re.sub(r'\s+', '', text.lower().strip())
     for mes in _MESES_NOMBRES:
         if mes in text_lower:
             return mes.capitalize()
-    return text
+    normalized = text_lower.translate(_MES_OCR_SUBS)
+    for mes in _MESES_NOMBRES:
+        if mes in normalized:
+            return mes.capitalize()
+    for prefix_len in (2, 3):
+        if len(normalized) >= prefix_len:
+            matches = [m for m in _MESES_NOMBRES if m.startswith(normalized[:prefix_len])]
+            if len(matches) == 1:
+                return matches[0].capitalize()
+    alpha_only = re.sub(r'[^a-z]', '', normalized)
+    if len(alpha_only) >= 3:
+        result = _mes_por_trigrams(alpha_only)
+        if result is not None:
+            return result
+    return normalized.upper() if normalized != text_lower else text
 
 
 def _limpiar_ano(text: str) -> str:
-    for year in re.findall(r'\d{4}', text):
+    for year in _FOUR_DIGITS_RE.findall(text):
         if 2020 <= int(year) <= 2030:
             return year
+    normalized = text.translate(_YEAR_OCR_SUBS)
+    for year in _FOUR_DIGITS_RE.findall(normalized):
+        if 2020 <= int(year) <= 2030:
+            return year
+    for partial in re.findall(r'\d{3}', normalized):
+        candidate = '20' + partial[-2:]
+        if 2020 <= int(candidate) <= 2030:
+            return candidate
     return text
 
 
@@ -168,8 +233,9 @@ def _expandir_tokens_de(tokens: list[OCRResult]) -> list[OCRResult]:
         if _DE_RE.match(text):
             result.append(t)
             continue
+        check_text = text.translate(_DAY_OCR_SUBS)
         has_embedded = bool(
-            re.search(r'\dDE|DE\d', text, re.IGNORECASE)
+            re.search(r'\dDE|DE\d', check_text, re.IGNORECASE)
             or re.match(r'^DE.', text, re.IGNORECASE)
         )
         if not has_embedded:
@@ -308,6 +374,7 @@ def _filtrar_tokens_fecha_estructura(
     mes_tokens = [
         tokens[i] for i in range(idx_de1 + 1, idx_de2)
         if not _BOILERPLATE_RE.match(tokens[i].text.strip())
+        and re.search(r'[a-zA-Z0-9]', tokens[i].text)
     ]
 
     anio_token: OCRResult | None = None

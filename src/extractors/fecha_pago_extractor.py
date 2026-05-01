@@ -110,7 +110,7 @@ class FechaPagoExtractor:
 
     @staticmethod
     def _result_desde_scan_window(scan_window: list[OCRResult]) -> FechaResult:
-        filtered, source_tokens, partial = _filtrar_tokens_fecha_estructura(scan_window)
+        filtered, source_tokens, partial = _filtrar_tokens_fecha_estructura(scan_window, skip_el_prefix=True)
         if len(filtered) == 1:
             iso = _fecha_completa_a_iso(filtered[0].text)
             if iso is not None:
