@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -11,42 +10,13 @@ logging.basicConfig(
     format="%(name)s: %(message)s",
 )
 
-from src.pdf.pdf_processor import pdf_a_imagenes, guardar_imagen, cargar_imagen
-from src.detection.check_detector import detectar_cheques
 from src.extractors.cheque_extractor import ChequeExtractor
 # from src.extractors.fecha_emision_extractor import make_vision_fecha_fn
 from src.ocr.ocr_readers import DocTRReader, TrOCRReader, SuryaReader
 from src.llm.llm_backends import OllamaBackend
 from src.llm.llm_validator import LLMValidator
 from src.models import DatosCheque, guardar_cheques_json, cargar_cheques_json
-
-
-def _extraer_de_imagen(
-    ruta_img: str,
-    num_pag: int,
-    idx: int,
-    pdf_name: str,
-    extractor: ChequeExtractor,
-    batch_montos_raw: list[str],
-    debug_dir: Path | None = None,
-) -> DatosCheque:
-    cheque_img = cargar_imagen(ruta_img)
-    cheque_debug_dir = None
-    if debug_dir is not None:
-        cheque_debug_dir = debug_dir / f"{Path(pdf_name).stem}_p{num_pag}_ch{idx}"
-        cheque_debug_dir.mkdir(exist_ok=True)
-    print(f"    Cheque {idx}...", end=" ", flush=True)
-    datos = extractor.extraer(cheque_img, debug_dir=cheque_debug_dir)
-    datos.imagen_path = ruta_img
-    datos.pdf_origen = pdf_name
-    datos.pagina = num_pag
-    datos.indice_en_pagina = idx
-    batch_montos_raw.append(datos.monto_raw)
-    monto_str = f"${datos.monto:,.2f}" if datos.monto else "no detectado"
-    conf_str = f" llm={datos.monto_llm_confidence:.2f}" if datos.monto_llm_confidence is not None else ""
-    fecha_str = f" fecha={datos.fecha_emision}" if datos.fecha_emision else ""
-    print(f"Monto: {monto_str} (score={datos.monto_score:.1f}{conf_str}{fecha_str})")
-    return datos
+from src.pipeline import procesar_pdf as _procesar_pdf_core
 
 
 def procesar_pdf(
@@ -55,45 +25,35 @@ def procesar_pdf(
     output_dir: str = "output",
     debug_dir: Path | None = None,
 ) -> list[DatosCheque]:
-    """Procesa un PDF con cheques escaneados, reutilizando imagenes si ya existen."""
-    pdf_path = Path(pdf_path)
-    img_dir = Path(output_dir) / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
+    """Wrapper de CLI que imprime progreso usando los callbacks del pipeline."""
+    pdf_path_obj = Path(pdf_path)
+    print(f"Procesando: {pdf_path_obj.name}")
 
-    print(f"Procesando: {pdf_path.name}")
+    def _on_pdf_loaded(total_paginas: int) -> None:
+        if total_paginas > 0:
+            print(f"  Paginas: {total_paginas}")
 
-    existing = sorted(
-        img_dir.glob(f"{pdf_path.stem}_p*_ch*.png"),
-        key=lambda p: tuple(int(x) for x in re.search(r"_p(\d+)_ch(\d+)\.png$", p.name).groups()),
+    def _on_cheque_detected(num_pag: int, idx: int, _ruta_img: str) -> None:
+        print(f"    Cheque p{num_pag}_ch{idx}...", end=" ", flush=True)
+
+    def _on_cheque_extracted(_num_pag: int, _idx: int, datos: DatosCheque) -> None:
+        monto_str = f"${datos.monto:,.2f}" if datos.monto else "no detectado"
+        conf_str = (
+            f" llm={datos.monto_llm_confidence:.2f}"
+            if datos.monto_llm_confidence is not None else ""
+        )
+        fecha_str = f" fecha={datos.fecha_emision}" if datos.fecha_emision else ""
+        print(f"Monto: {monto_str} (score={datos.monto_score:.1f}{conf_str}{fecha_str})")
+
+    return _procesar_pdf_core(
+        pdf_path,
+        extractor,
+        output_dir=output_dir,
+        debug_dir=debug_dir,
+        on_pdf_loaded=_on_pdf_loaded,
+        on_cheque_detected=_on_cheque_detected,
+        on_cheque_extracted=_on_cheque_extracted,
     )
-
-    cheques_datos: list[DatosCheque] = []
-    batch_montos_raw: list[str] = []
-
-    if existing:
-        print(f"  Reutilizando {len(existing)} imagenes existentes")
-        for img_path in existing:
-            m = re.search(r"_p(\d+)_ch(\d+)\.png$", img_path.name)
-            num_pag, idx = int(m.group(1)), int(m.group(2))
-            datos = _extraer_de_imagen(str(img_path), num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
-            cheques_datos.append(datos)
-        return cheques_datos
-
-    paginas = pdf_a_imagenes(str(pdf_path), dpi=300)
-    print(f"  Paginas: {len(paginas)}")
-
-    for num_pag, pagina in enumerate(paginas, 1):
-        cheques_img = detectar_cheques(pagina)
-        print(f"  Pagina {num_pag}: {len(cheques_img)} cheques detectados")
-
-        for idx, cheque_img in enumerate(cheques_img, 1):
-            nombre_img = f"{pdf_path.stem}_p{num_pag}_ch{idx}.png"
-            ruta_img = str(img_dir / nombre_img)
-            guardar_imagen(cheque_img, ruta_img)
-            datos = _extraer_de_imagen(ruta_img, num_pag, idx, pdf_path.name, extractor, batch_montos_raw, debug_dir)
-            cheques_datos.append(datos)
-
-    return cheques_datos
 
 
 def cmd_procesar(args):
