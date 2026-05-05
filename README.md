@@ -214,6 +214,42 @@ pps-cheques/
 └── .venv/                           # Entorno virtual (no incluido en git)
 ```
 
+## Interfaz gráfica (GUI)
+
+Además de la CLI, el proyecto incluye una interfaz web para cargar PDFs,
+visualizar los cheques recortados en vivo, y editar los campos extraídos.
+
+Arquitectura: backend FastAPI (`api/`) + frontend Vite/React (`frontend/`),
+comunicación vía SSE para los eventos de progreso.
+
+### Primera vez
+
+```bash
+# backend (Python deps ya están en requirements.txt)
+pip install -r requirements.txt
+
+# frontend
+cd frontend
+npm install
+cd ..
+```
+
+### Correr (dos terminales)
+
+```bash
+# terminal 1 — backend
+.venv/Scripts/python.exe -m uvicorn api.main:app --port 8000 --reload
+
+# terminal 2 — frontend
+cd frontend
+npm run dev
+```
+
+Abrir [http://localhost:5173](http://localhost:5173). Vite proxea `/api/*` al
+backend, no hace falta CORS.
+
+Para más detalles ver [docs/plan_gui.md](docs/plan_gui.md).
+
 ## Licencia
 
 MIT
