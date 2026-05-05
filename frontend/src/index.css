@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: light dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  background-color: rgb(249 250 251);
+  color: rgb(17 24 39);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: rgb(17 24 39);
+    color: rgb(243 244 246);
+  }
+}
